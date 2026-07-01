@@ -135,32 +135,93 @@ async def synthesize_edge_mp3(text: str, voice: str = "zh-CN-XiaoxiaoNeural") ->
         return mp3_path.read_bytes()
 
 
+class AzureEmbeddedTTSGrpcClient:
+    def __init__(self, audio_settings: AudioSettings) -> None:
+        try:
+            import grpc
+            from voice_agent.providers import azure_embedded_pb2 as pb
+            from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
+        except ImportError as exc:
+            raise RuntimeError("Install grpcio and generate Azure Embedded gRPC stubs to use azure-embedded TTS") from exc
+
+        self._audio_settings = audio_settings
+        self._pb = pb
+        self._channel = grpc.insecure_channel(audio_settings.azure_embedded_tts_grpc_url)
+        self._stub = pb_grpc.AzureEmbeddedSpeechStub(self._channel)
+
+    def synthesize(self, text: str) -> bytes:
+        if not text.strip():
+            raise RuntimeError("Cannot synthesize empty text")
+        response = self._stub.Synthesize(self._request(text), timeout=30)
+        if not response.audio:
+            raise RuntimeError("Azure Embedded TTS returned empty audio")
+        return bytes(response.audio)
+
+    def _request(self, text: str):
+        voice = self._audio_settings.azure_embedded_tts_voice
+        locale = "en-US" if "en-US" in voice else "zh-CN"
+        return self._pb.TtsRequest(
+            voice=voice,
+            locale=locale,
+            text=text,
+            sample_rate_hz=self._audio_settings.tts_sample_rate,
+        )
+
+    def close(self) -> None:
+        self._channel.close()
+
+
+class AsyncAzureEmbeddedTTSGrpcClient:
+    def __init__(self, audio_settings: AudioSettings) -> None:
+        try:
+            import grpc
+            from voice_agent.providers import azure_embedded_pb2 as pb
+            from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
+        except ImportError as exc:
+            raise RuntimeError("Install grpcio and generate Azure Embedded gRPC stubs to use azure-embedded TTS") from exc
+
+        self._audio_settings = audio_settings
+        self._pb = pb
+        self._channel = grpc.aio.insecure_channel(audio_settings.azure_embedded_tts_grpc_url)
+        self._stub = pb_grpc.AzureEmbeddedSpeechStub(self._channel)
+
+    async def synthesize(self, text: str) -> bytes:
+        if not text.strip():
+            raise RuntimeError("Cannot synthesize empty text")
+        response = await self._stub.Synthesize(self._request(text), timeout=30)
+        if not response.audio:
+            raise RuntimeError("Azure Embedded TTS returned empty audio")
+        return bytes(response.audio)
+
+    def _request(self, text: str):
+        voice = self._audio_settings.azure_embedded_tts_voice
+        locale = "en-US" if "en-US" in voice else "zh-CN"
+        return self._pb.TtsRequest(
+            voice=voice,
+            locale=locale,
+            text=text,
+            sample_rate_hz=self._audio_settings.tts_sample_rate,
+        )
+
+    async def close(self) -> None:
+        await self._channel.close()
+
+
 def synthesize_azure_embedded_wav(text: str, audio_settings: AudioSettings) -> bytes:
     if not text.strip():
         raise RuntimeError("Cannot synthesize empty text")
+    client = AzureEmbeddedTTSGrpcClient(audio_settings)
     try:
-        import grpc
-        from voice_agent.providers import azure_embedded_pb2 as pb
-        from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
-    except ImportError as exc:
-        raise RuntimeError("Install grpcio and generate Azure Embedded gRPC stubs to use azure-embedded TTS") from exc
-
-    voice = audio_settings.azure_embedded_tts_voice
-    locale = "en-US" if "en-US" in voice else "zh-CN"
-    channel = grpc.insecure_channel(audio_settings.azure_embedded_grpc_url)
-    stub = pb_grpc.AzureEmbeddedSpeechStub(channel)
-    try:
-        response = stub.Synthesize(
-            pb.TtsRequest(
-                voice=voice,
-                locale=locale,
-                text=text,
-                sample_rate_hz=audio_settings.tts_sample_rate,
-            ),
-            timeout=30,
-        )
+        return client.synthesize(text)
     finally:
-        channel.close()
-    if not response.audio:
-        raise RuntimeError("Azure Embedded TTS returned empty audio")
-    return bytes(response.audio)
+        client.close()
+
+
+async def synthesize_azure_embedded_wav_async(text: str, audio_settings: AudioSettings) -> bytes:
+    if not text.strip():
+        raise RuntimeError("Cannot synthesize empty text")
+    client = AsyncAzureEmbeddedTTSGrpcClient(audio_settings)
+    try:
+        return await client.synthesize(text)
+    finally:
+        await client.close()

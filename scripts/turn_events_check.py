@@ -14,7 +14,7 @@ def main() -> None:
         "http://127.0.0.1:8787/api/session/turn-events",
         files={
             "audio": ("input.wav", audio, "audio/wav"),
-            "tts_provider": (None, "windows-sapi"),
+            "tts_provider": (None, "azure-embedded"),
         },
         timeout=240,
     ) as response:

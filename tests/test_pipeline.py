@@ -8,7 +8,7 @@ from voice_agent.pipeline import build_pipeline_blueprint
 
 
 class PipelineBlueprintTests(unittest.TestCase):
-    def test_foundry_asr_uses_batch_transport_without_silent_fallback(self):
+    def test_foundry_asr_uses_streaming_upload_without_silent_fallback(self):
         settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
 
         blueprint = build_pipeline_blueprint(settings)
@@ -18,8 +18,8 @@ class PipelineBlueprintTests(unittest.TestCase):
         self.assertTrue(blueprint.full_duplex)
         self.assertTrue(blueprint.barge_in_enabled)
         self.assertEqual(blueprint.asr_inference_mode, "streaming")
-        self.assertEqual(blueprint.asr_transport_mode, "batch")
-        self.assertEqual(blueprint.transport, "browser-batch")
+        self.assertEqual(blueprint.asr_transport_mode, "streaming")
+        self.assertEqual(blueprint.transport, "browser-streaming")
         self.assertEqual(vad_stage.role, "start-end")
         self.assertEqual(asr_stage.provider, "foundry-local")
         self.assertIsNone(asr_stage.fallback_provider)

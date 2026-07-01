@@ -69,9 +69,9 @@ VOICE_AGENT_FOUNDRY_TIMEOUT_SECONDS=180
 The local model assets are ignored by Git under `models/`. Keep encrypted ASR assets and extracted TTS voice folders in this layout:
 
 ```text
-models/azure-embedded/asr/zh-CN/encrypted/35M/
-models/azure-embedded/asr/en-GB/encrypted/v6/35M/
-models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralHD/
+models/azure-embedded/asr/zh-CN/decrypted/35M/
+models/azure-embedded/asr/en-GB/decrypted/v6/35M/
+models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralV6/
 models/azure-embedded/tts/en-US/AvaNeuralHDv2/
 ```
 
@@ -79,7 +79,7 @@ The TTS zip files are external inputs and should not be committed. To populate t
 
 ```powershell
 New-Item -ItemType Directory -Force models\azure-embedded\tts\zh-CN,models\azure-embedded\tts\en-US
-tar -xf C:\Users\shawnq\Downloads\XiaoxiaoNeuralHD.zip -C models\azure-embedded\tts\zh-CN
+tar -xf C:\Users\shawnq\Downloads\XiaoxiaoNeuralV6.zip -C models\azure-embedded\tts\zh-CN
 tar -xf C:\Users\shawnq\Downloads\AvaNeuralHDv2.zip -C models\azure-embedded\tts\en-US
 ```
 
@@ -88,15 +88,16 @@ Set these values in `.env`:
 ```text
 PASCO_MODEL_KEY=<local model key>
 VOICE_AGENT_AZURE_EMBEDDED_GRPC_URL=127.0.0.1:8792
+VOICE_AGENT_AZURE_EMBEDDED_TTS_GRPC_URL=127.0.0.1:8793
 VOICE_AGENT_AZURE_EMBEDDED_ASR_LOCALE=zh-CN
-VOICE_AGENT_AZURE_EMBEDDED_ASR_ZH_CN_MODEL_DIR=models/azure-embedded/asr/zh-CN/encrypted/35M
-VOICE_AGENT_AZURE_EMBEDDED_ASR_EN_GB_MODEL_DIR=models/azure-embedded/asr/en-GB/encrypted/v6/35M
-VOICE_AGENT_AZURE_EMBEDDED_TTS_VOICE=azure-embedded-zh-CN-XiaoxiaoNeuralHD
-VOICE_AGENT_AZURE_EMBEDDED_TTS_ZH_CN_MODEL_DIR=models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralHD
+VOICE_AGENT_AZURE_EMBEDDED_ASR_ZH_CN_MODEL_DIR=models/azure-embedded/asr/zh-CN/decrypted/35M
+VOICE_AGENT_AZURE_EMBEDDED_ASR_EN_GB_MODEL_DIR=models/azure-embedded/asr/en-GB/decrypted/v6/35M
+VOICE_AGENT_AZURE_EMBEDDED_TTS_VOICE=azure-embedded-zh-CN-XiaoxiaoNeuralV6
+VOICE_AGENT_AZURE_EMBEDDED_TTS_ZH_CN_MODEL_DIR=models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralV6
 VOICE_AGENT_AZURE_EMBEDDED_TTS_EN_US_MODEL_DIR=models/azure-embedded/tts/en-US/AvaNeuralHDv2
 ```
 
-Current status: the Python provider boundary now targets a native gRPC sidecar on `127.0.0.1:8792` using `protos/azure_embedded_speech.proto`. The C++ scaffold lives in `native/azure_embedded_speech_grpc` and targets Azure Speech SDK `1.47`. This machine still needs a C++ toolchain, gRPC C++/protobuf, and Speech SDK C++ headers/libs before that sidecar can be compiled. The current ASR model assets are incompatible with the 1.47 recognition runtime, so the legacy .NET sidecar remains in `AzureEmbeddedSpeech` as a module-runnable compatibility path pinned to Speech SDK `1.24.2`. Python ASR tries native gRPC first and falls back to the legacy WebSocket sidecar while the native 1.47 path is unavailable.
+Current status: ASR and TTS use native gRPC sidecars backed by Azure Speech SDK `1.47`. ASR listens on `127.0.0.1:8792`, TTS listens on `127.0.0.1:8793`, and both use `protos/azure_embedded_speech.proto`. ASR defaults to decrypted model assets; TTS defaults to `XiaoxiaoNeuralV6`.
 
 Generate Python gRPC stubs after installing dev dependencies:
 
@@ -104,25 +105,19 @@ Generate Python gRPC stubs after installing dev dependencies:
 python scripts\generate_grpc_stubs.py
 ```
 
-Build the native sidecar once CMake, vcpkg/gRPC, protobuf, and the Speech SDK C++ package are available:
+Build the native sidecars once CMake, vcpkg/gRPC, protobuf, and the Speech SDK C++ package are available:
 
 ```powershell
 cmake -S native\azure_embedded_speech_grpc -B native\azure_embedded_speech_grpc\build -DSPEECHSDK_ROOT=<speech-sdk-cpp-root>
-cmake --build native\azure_embedded_speech_grpc\build --config Release
+cmake --build native\azure_embedded_speech_grpc\build --config Release --target azure_embedded_speech_grpc azure_embedded_tts_grpc
 ```
 
-The old decrypted ASR folders are not used and should remain absent:
-
-```text
-models/azure-embedded-asr/*/decrypted/  # removed
-```
-
-Run the sidecar:
+Run the sidecars:
 
 ```powershell
-$env:PASCO_MODEL_KEY = (Get-Content .env | Select-String '^PASCO_MODEL_KEY=').ToString().Split('=',2)[1].Trim('"')
 $env:VOICE_AGENT_AZURE_EMBEDDED_MODEL_ROOT = 'models/azure-embedded'
-dotnet run --project AzureEmbeddedSpeech\AzureEmbeddedSpeech.csproj  # legacy migration reference
+.\native\azure_embedded_speech_grpc\build\Release\azure_embedded_speech_grpc.exe
+.\native\azure_embedded_speech_grpc\build\tts\Release\azure_embedded_tts_grpc.exe
 ```
 
 Validate it:

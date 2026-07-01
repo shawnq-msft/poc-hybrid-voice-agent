@@ -18,7 +18,7 @@ def expected_paths(root: Path) -> list[ModelPath]:
     return [
         ModelPath("asr", "zh-CN 35M encrypted", azure_root / "asr" / "zh-CN" / "encrypted" / "35M"),
         ModelPath("asr", "en-GB 35M encrypted", azure_root / "asr" / "en-GB" / "encrypted" / "v6" / "35M"),
-        ModelPath("tts", "zh-CN XiaoxiaoNeuralHD", azure_root / "tts" / "zh-CN" / "XiaoxiaoNeuralHD"),
+        ModelPath("tts", "zh-CN XiaoxiaoNeuralV6", azure_root / "tts" / "zh-CN" / "XiaoxiaoNeuralV6"),
         ModelPath("tts", "en-US AvaNeuralHDv2", azure_root / "tts" / "en-US" / "AvaNeuralHDv2"),
     ]
 

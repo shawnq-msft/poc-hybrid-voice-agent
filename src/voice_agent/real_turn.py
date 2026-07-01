@@ -3,15 +3,18 @@ from __future__ import annotations
 import base64
 import inspect
 import asyncio
+import os
+import socket
 from time import perf_counter
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from voice_agent.config import Settings
 from voice_agent.pipecat_runtime.events import ProgressCallback, emit_progress, progress_event
 from voice_agent.providers.asr import ASRTranscript, AzureEmbeddedASR, FasterWhisperASR, FoundryLocalASR, warm_faster_whisper, warm_foundry_streaming_asr
 from voice_agent.providers.llm_foundry import ChatMessage, FoundryLocalLLM
-from voice_agent.providers.tts_windows import synthesize_azure_embedded_wav, synthesize_edge_mp3, synthesize_sapi_wav
+from voice_agent.providers.tts_windows import AsyncAzureEmbeddedTTSGrpcClient, synthesize_azure_embedded_wav, synthesize_edge_mp3, synthesize_sapi_wav
 from voice_agent.providers.vad import SileroVad, VadDecision, warm_silero_vad
 
 
@@ -41,6 +44,9 @@ class VADClient(Protocol):
         ...
 
 
+DEFAULT_SYSTEM_PROMPT = "You are a helpful voice assistant."
+
+
 @dataclass(frozen=True)
 class SapiTTSClient:
     voice: str | None = None
@@ -57,12 +63,23 @@ class EdgeTTSClient:
         return await synthesize_edge_mp3(text, self.voice)
 
 
-@dataclass(frozen=True)
+@dataclass
 class AzureEmbeddedTTSClient:
     settings: Settings
+    _client: AsyncAzureEmbeddedTTSGrpcClient | None = None
 
     def synthesize(self, text: str) -> bytes:
         return synthesize_azure_embedded_wav(text, self.settings.audio)
+
+    async def synthesize_async(self, text: str) -> bytes:
+        if self._client is None:
+            self._client = AsyncAzureEmbeddedTTSGrpcClient(self.settings.audio)
+        return await self._client.synthesize(text)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +134,8 @@ async def run_real_turn(
     tts_client: TTSClient | None = None,
     vad_client: VADClient | None = None,
     progress_callback: ProgressCallback | None = None,
+    llm_prompt: str | None = None,
+    llm_context: str | None = None,
 ) -> RealTurnResult:
     total_started = perf_counter()
     if len(audio_bytes) < 128:
@@ -124,6 +143,7 @@ async def run_real_turn(
 
     asr = asr_client or _default_asr_client(settings)
     llm = llm_client or FoundryLocalLLM(settings.foundry)
+    owns_tts = tts_client is None
     tts = tts_client or _default_tts_client(settings)
 
     vad_started = perf_counter()
@@ -145,7 +165,13 @@ async def run_real_turn(
         raise RuntimeError("ASR returned empty text")
     await _emit_progress(progress_callback, "asr", "idle", latency_ms=asr_ms, text=transcript.text)
 
-    assistant_turn = await _complete_assistant_turn(settings, transcript.text, llm, tts, progress_callback)
+    try:
+        assistant_turn = await _complete_assistant_turn(settings, transcript.text, llm, tts, progress_callback, llm_prompt=llm_prompt, llm_context=llm_context)
+    finally:
+        if owns_tts and hasattr(tts, "close"):
+            close_result = tts.close()
+            if inspect.isawaitable(close_result):
+                await close_result
 
     return RealTurnResult(
         status="passed",
@@ -177,6 +203,8 @@ async def run_text_turn(
     asr_provider: str = "azure-embedded",
     vad_ms: float = 0.0,
     asr_ms: float = 0.0,
+    llm_prompt: str | None = None,
+    llm_context: str | None = None,
 ) -> RealTurnResult:
     total_started = perf_counter()
     normalized_text = user_text.strip()
@@ -184,8 +212,15 @@ async def run_text_turn(
         raise RuntimeError("Text turn requires non-empty user text")
 
     llm = llm_client or FoundryLocalLLM(settings.foundry)
+    owns_tts = tts_client is None
     tts = tts_client or _default_tts_client(settings)
-    assistant_turn = await _complete_assistant_turn(settings, normalized_text, llm, tts, progress_callback)
+    try:
+        assistant_turn = await _complete_assistant_turn(settings, normalized_text, llm, tts, progress_callback, llm_prompt=llm_prompt, llm_context=llm_context)
+    finally:
+        if owns_tts and hasattr(tts, "close"):
+            close_result = tts.close()
+            if inspect.isawaitable(close_result):
+                await close_result
     return RealTurnResult(
         status="passed",
         user_text=normalized_text,
@@ -260,7 +295,9 @@ def _default_tts_client(settings: Settings):
 
 
 async def _synthesize_tts(tts, text: str) -> tuple[bytes, str]:
-    if isinstance(tts, EdgeTTSClient):
+    if hasattr(tts, "synthesize_async"):
+        audio_bytes = await tts.synthesize_async(text)
+    elif isinstance(tts, EdgeTTSClient):
         output = tts.synthesize(text)
         if inspect.isawaitable(output):
             audio_bytes = await output
@@ -278,14 +315,15 @@ async def _complete_assistant_turn(
     llm,
     tts,
     progress_callback: ProgressCallback | None = None,
+    llm_prompt: str | None = None,
+    llm_context: str | None = None,
 ) -> AssistantTurnPayload:
-    messages = [
-        ChatMessage(
-            "system",
-            "You are a concise local voice assistant. Reply in the user's language when possible. Do not ask for credentials, tokens, session IDs, or other secrets.",
-        ),
-        ChatMessage("user", user_text),
-    ]
+    system_prompt = (llm_prompt or DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
+    messages = [ChatMessage("system", system_prompt)]
+    context = (llm_context or "").strip()
+    if context:
+        messages.append(ChatMessage("system", f"Context:\n{context}"))
+    messages.append(ChatMessage("user", user_text))
     await _emit_progress(progress_callback, "llm", "running")
     assistant_text, llm_ms, llm_first_sentence_ms, llm_total_ms, tts_payload = await _run_llm_and_tts(
         llm,
@@ -342,6 +380,8 @@ async def _run_llm_and_tts(
     if hasattr(llm, "stream"):
         try:
             return await _stream_llm_and_tts(llm, tts, messages, progress_callback)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -370,51 +410,58 @@ async def _stream_llm_and_tts(
     pending_text = ""
     tts_tasks: list[asyncio.Task[tuple[bytes, str, float]]] = []
 
-    async for token in llm.stream(messages):
-        if first_token_ms is None:
-            first_token_ms = _elapsed_ms(llm_started)
-            await _emit_progress(progress_callback, "llm", "ttft", latency_ms=first_token_ms)
-        await _emit_progress(progress_callback, "llm", "token", text=token)
-        assistant_parts.append(token)
-        pending_text += token
-        while True:
-            split_index = _first_sentence_boundary(pending_text)
-            if split_index is None:
-                break
-            segment = pending_text[: split_index + 1].strip()
-            pending_text = pending_text[split_index + 1 :]
-            if segment:
-                if first_sentence_ms is None:
-                    first_sentence_ms = _elapsed_ms(llm_started)
-                    await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
-                await _emit_progress(progress_callback, "tts", "running", text=segment)
-                tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, segment, progress_callback)))
+    try:
+        async for token in llm.stream(messages):
+            if first_token_ms is None:
+                first_token_ms = _elapsed_ms(llm_started)
+                await _emit_progress(progress_callback, "llm", "ttft", latency_ms=first_token_ms)
+            await _emit_progress(progress_callback, "llm", "token", text=token)
+            assistant_parts.append(token)
+            pending_text += token
+            while True:
+                split_index = _first_sentence_boundary(pending_text)
+                if split_index is None:
+                    break
+                segment = pending_text[: split_index + 1].strip()
+                pending_text = pending_text[split_index + 1 :]
+                if segment:
+                    if first_sentence_ms is None:
+                        first_sentence_ms = _elapsed_ms(llm_started)
+                        await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
+                    await _emit_progress(progress_callback, "tts", "running", text=segment)
+                    tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, segment, progress_callback)))
 
-    if pending_text.strip():
-        if first_sentence_ms is None:
-            first_sentence_ms = _elapsed_ms(llm_started)
-            await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
-        tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, pending_text.strip(), progress_callback)))
+        if pending_text.strip():
+            if first_sentence_ms is None:
+                first_sentence_ms = _elapsed_ms(llm_started)
+                await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
+            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, pending_text.strip(), progress_callback)))
 
-    assistant_text = "".join(assistant_parts).strip()
-    if not assistant_text:
-        raise RuntimeError("LLM stream returned empty text")
-    if not tts_tasks:
-        tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, assistant_text, progress_callback)))
+        assistant_text = "".join(assistant_parts).strip()
+        if not assistant_text:
+            raise RuntimeError("LLM stream returned empty text")
+        if not tts_tasks:
+            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, assistant_text, progress_callback)))
 
-    tts_results = [await task for task in tts_tasks]
-    first_tts_ms = tts_results[0][2]
-    segment_tts_total_ms = round(sum(result[2] for result in tts_results), 1)
-    full_tts_started = perf_counter()
-    audio_bytes, audio_media_type = await _synthesize_tts(tts, assistant_text)
-    full_tts_ms = _elapsed_ms(full_tts_started)
-    total_tts_ms = round(segment_tts_total_ms + full_tts_ms, 1)
-    return assistant_text, first_token_ms or _elapsed_ms(llm_started), first_sentence_ms or _elapsed_ms(llm_started), _elapsed_ms(llm_started), (
-        audio_bytes,
-        audio_media_type,
-        first_tts_ms,
-        total_tts_ms,
-    )
+        tts_results = [await task for task in tts_tasks]
+        first_tts_ms = tts_results[0][2]
+        segment_tts_total_ms = round(sum(result[2] for result in tts_results), 1)
+        full_tts_started = perf_counter()
+        audio_bytes, audio_media_type = await _synthesize_tts(tts, assistant_text)
+        full_tts_ms = _elapsed_ms(full_tts_started)
+        total_tts_ms = round(segment_tts_total_ms + full_tts_ms, 1)
+        return assistant_text, first_token_ms or _elapsed_ms(llm_started), first_sentence_ms or _elapsed_ms(llm_started), _elapsed_ms(llm_started), (
+            audio_bytes,
+            audio_media_type,
+            first_tts_ms,
+            total_tts_ms,
+        )
+    except asyncio.CancelledError:
+        for task in tts_tasks:
+            task.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+        raise
 
 
 async def _timed_synthesize_tts(
@@ -502,44 +549,224 @@ async def warm_real_chain(settings: Settings) -> dict[str, object]:
     timings: dict[str, float] = {}
     statuses: dict[str, object] = {}
 
-    started = perf_counter()
-    warm_silero_vad()
-    timings["vad"] = _elapsed_ms(started)
-    statuses["vad"] = {"provider": "silero"}
+    async for event in iter_warm_real_chain(settings):
+        if event.get("event") != "model_loaded":
+            continue
+        stage = str(event["stage"])
+        timings[stage] = float(event.get("latencyMs") or 0.0)
+        details = event.get("details")
+        statuses[stage] = details if isinstance(details, dict) else {}
+
+    return {"status": "ready", "timingsMs": timings, "models": statuses}
+
+
+async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, object]]:
+    async def emit_loaded(
+        stage: str,
+        details: dict[str, object],
+        started: float,
+        memory_before: int,
+        process_id: int | None = None,
+    ) -> dict[str, object]:
+        memory_after = _rss_bytes_for_pid(process_id) if process_id is not None else None
+        if memory_after is None:
+            memory_after = _current_rss_bytes()
+        return {
+            "event": "model_loaded",
+            "stage": stage,
+            "status": "loaded",
+            "latencyMs": _elapsed_ms(started),
+            "memoryRssMb": _bytes_to_mb(memory_after),
+            "memoryDeltaMb": _bytes_to_mb(memory_after - memory_before),
+            "memorySource": "sidecar" if process_id is not None else "server",
+            "details": details,
+        }
 
     started = perf_counter()
+    memory_before = _current_rss_bytes()
+    await asyncio.to_thread(warm_silero_vad)
+    yield await emit_loaded("vad", {"provider": "silero"}, started, memory_before)
+
+    started = perf_counter()
+    memory_before = _current_rss_bytes()
+    if settings.providers.asr == "foundry-local":
+        ready = await check_foundry_ready(settings)
+        if not ready.get("ready"):
+            raise RuntimeError(f"Foundry Local ASR is not ready: {ready.get('error')}")
+        asr_status = await asyncio.to_thread(warm_foundry_streaming_asr, settings.foundry.asr_model)
+        yield await emit_loaded("asr", {**asr_status, "language": settings.audio.asr_language, "endpoint": settings.foundry.endpoint}, started, memory_before)
+    elif settings.providers.asr == "azure-embedded":
+        sidecar_pid = _pid_for_grpc_url(settings.audio.azure_embedded_grpc_url)
+        memory_before = _rss_bytes_for_pid(sidecar_pid) or memory_before
+        asr_status = await asyncio.to_thread(_warm_azure_embedded_asr_sidecar, settings)
+        yield await emit_loaded("asr", {**asr_status, "processId": sidecar_pid}, started, memory_before, process_id=sidecar_pid)
+    else:
+        await asyncio.to_thread(warm_faster_whisper, settings.audio.faster_whisper_model, "cpu", "int8")
+        yield await emit_loaded("asr", {"provider": "faster-whisper", "model": settings.audio.faster_whisper_model}, started, memory_before)
+
+    started = perf_counter()
+    memory_before = _current_rss_bytes()
     ready = await check_foundry_ready(settings)
     if not ready.get("ready"):
-        raise RuntimeError(f"Foundry Local is not ready: {ready.get('error')}")
-
-    asr_started = perf_counter()
-    if settings.providers.asr == "foundry-local":
-        asr_status = await asyncio.to_thread(warm_foundry_streaming_asr, settings.foundry.asr_model)
-        timings["asr"] = _elapsed_ms(asr_started)
-        statuses["asr"] = {**asr_status, "language": settings.audio.asr_language}
-    elif settings.providers.asr == "azure-embedded":
-        timings["asr"] = _elapsed_ms(asr_started)
-        statuses["asr"] = {
-            "provider": "azure-embedded",
-            "locale": settings.audio.azure_embedded_asr_locale,
-        }
-    else:
-        warm_faster_whisper(settings.audio.faster_whisper_model, "cpu", "int8")
-        timings["asr"] = _elapsed_ms(asr_started)
-        statuses["asr"] = {"provider": "faster-whisper", "model": settings.audio.faster_whisper_model}
-
+        raise RuntimeError(f"Foundry Local LLM is not ready: {ready.get('error')}")
     await FoundryLocalLLM(settings.foundry).complete(
         [ChatMessage("system", "Reply with OK only."), ChatMessage("user", "OK?")]
     )
-    timings["llm"] = _elapsed_ms(started)
-    statuses["llm"] = {"provider": "foundry-local", "model": settings.foundry.llm_model}
+    yield await emit_loaded("llm", {"provider": "foundry-local", "model": settings.foundry.llm_model, "endpoint": settings.foundry.endpoint}, started, memory_before)
 
     started = perf_counter()
-    await _synthesize_tts(_default_tts_client(settings), "Ready.")
-    timings["tts"] = _elapsed_ms(started)
-    tts_voice = settings.audio.edge_tts_voice
+    memory_before = _current_rss_bytes()
     if settings.providers.tts == "azure-embedded":
-        tts_voice = settings.audio.azure_embedded_tts_voice
-    statuses["tts"] = {"provider": settings.providers.tts, "voice": tts_voice}
+        sidecar_pid = _pid_for_grpc_url(settings.audio.azure_embedded_tts_grpc_url)
+        memory_before = _rss_bytes_for_pid(sidecar_pid) or memory_before
+        tts_status = await asyncio.to_thread(_check_azure_embedded_health, settings.audio.azure_embedded_tts_grpc_url, "tts", settings.audio.azure_embedded_tts_voice)
+        await _synthesize_tts(_default_tts_client(settings), "Ready.")
+        yield await emit_loaded("tts", {**tts_status, "voice": settings.audio.azure_embedded_tts_voice, "processId": sidecar_pid}, started, memory_before, process_id=sidecar_pid)
+    else:
+        await _synthesize_tts(_default_tts_client(settings), "Ready.")
+        tts_voice = settings.audio.edge_tts_voice if settings.providers.tts == "edge-tts" else settings.audio.windows_tts_voice
+        yield await emit_loaded("tts", {"provider": settings.providers.tts, "voice": tts_voice}, started, memory_before)
 
-    return {"status": "ready", "timingsMs": timings, "models": statuses}
+
+def _current_rss_bytes() -> int:
+    try:
+        import psutil
+    except ImportError:
+        return 0
+    return int(psutil.Process(os.getpid()).memory_info().rss)
+
+
+def _rss_bytes_for_pid(process_id: int | None) -> int | None:
+    if process_id is None:
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return int(psutil.Process(process_id).memory_info().rss)
+    except Exception:
+        return None
+
+
+def _bytes_to_mb(value: int) -> float | None:
+    if value == 0:
+        return None
+    return round(value / (1024 * 1024), 1)
+
+
+def _check_azure_embedded_health(grpc_url: str, kind: str, expected: str) -> dict[str, object]:
+    try:
+        import grpc
+        from voice_agent.providers import azure_embedded_pb2 as pb
+        from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
+    except ImportError as exc:
+        raise RuntimeError("Install grpcio and generate Azure Embedded gRPC stubs to use azure-embedded") from exc
+
+    channel = grpc.insecure_channel(grpc_url)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=2.0)
+        response = pb_grpc.AzureEmbeddedSpeechStub(channel).Health(pb.HealthRequest(), timeout=5)
+    except Exception as exc:
+        message = _grpc_error_message(exc)
+        suffix = f": {message}" if message else ""
+        raise RuntimeError(f"Azure Embedded {kind.upper()} sidecar is not reachable at {grpc_url}{suffix}. Start the native sidecar for this port before loading models.") from exc
+    finally:
+        channel.close()
+
+    models = response.asr_models if kind == "asr" else response.tts_models
+    statuses = [
+        {
+            "id": model.id,
+            "locale": model.locale,
+            "path": model.path,
+            "loaded": bool(model.loaded),
+            "detail": model.detail,
+        }
+        for model in models
+    ]
+    match = next((model for model in statuses if model["id"] == expected or model["locale"] == expected), None)
+    if match is None:
+        known = ", ".join(str(model["id"]) for model in statuses) or "none"
+        raise RuntimeError(f"Azure Embedded {kind.upper()} sidecar at {grpc_url} does not expose {expected}; available: {known}")
+    if match.get("loaded") is False and "missing" in str(match.get("detail", "")):
+        raise RuntimeError(f"Azure Embedded {kind.upper()} model {expected} is not loadable: {match.get('detail')}")
+    return {"provider": "azure-embedded", "url": grpc_url, "model": expected, "sidecarStatus": response.status, "modelStatus": match}
+
+
+def _warm_azure_embedded_asr_sidecar(settings: Settings) -> dict[str, object]:
+    status = _check_azure_embedded_health(settings.audio.azure_embedded_grpc_url, "asr", settings.audio.azure_embedded_asr_locale)
+    pcm16 = b"\x00\x00" * 3200
+    try:
+        import grpc
+        from voice_agent.providers import azure_embedded_pb2 as pb
+        from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
+    except ImportError as exc:
+        raise RuntimeError("Install grpcio and generate Azure Embedded gRPC stubs to use azure-embedded ASR") from exc
+
+    def requests():
+        yield pb.AsrRequest(
+            config=pb.AsrConfig(
+                locale=settings.audio.azure_embedded_asr_locale,
+                sample_rate_hz=16000,
+                channels=1,
+                bits_per_sample=16,
+            )
+        )
+        yield pb.AsrRequest(pcm16=pcm16)
+        yield pb.AsrRequest(end=True)
+
+    channel = grpc.insecure_channel(settings.audio.azure_embedded_grpc_url)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=2.0)
+        for event in pb_grpc.AzureEmbeddedSpeechStub(channel).Recognize(requests(), timeout=15):
+            event_type = getattr(event, "type", "")
+            if event_type == "error":
+                raise RuntimeError(getattr(event, "detail", "Azure Embedded ASR warmup failed"))
+            if event_type == "final":
+                status["warmup"] = {"bytes": len(pcm16), "elapsedMs": getattr(event, "elapsed_ms", 0)}
+                return status
+    except Exception as exc:
+        raise RuntimeError(f"Azure Embedded ASR warmup failed at {settings.audio.azure_embedded_grpc_url}: {_grpc_error_message(exc)}") from exc
+    finally:
+        channel.close()
+    status["warmup"] = {"bytes": len(pcm16)}
+    return status
+
+
+def _pid_for_grpc_url(grpc_url: str) -> int | None:
+    host, _, port_text = grpc_url.rpartition(":")
+    if not host or not port_text.isdigit():
+        return None
+    if host not in {"127.0.0.1", "localhost", "0.0.0.0"}:
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    port = int(port_text)
+    for connection in psutil.net_connections(kind="tcp"):
+        local = connection.laddr
+        if getattr(local, "port", None) == port and connection.status == psutil.CONN_LISTEN:
+            return connection.pid
+    return None
+
+
+def _grpc_error_message(exc: Exception) -> str:
+    details = getattr(exc, "details", None)
+    if callable(details):
+        try:
+            return str(details())
+        except Exception:
+            pass
+    if isinstance(exc, (ConnectionRefusedError, TimeoutError, socket.timeout)):
+        return str(exc)
+    message = str(exc)
+    if not message:
+        code = getattr(exc, "code", None)
+        if callable(code):
+            try:
+                message = str(code())
+            except Exception:
+                message = ""
+    return message

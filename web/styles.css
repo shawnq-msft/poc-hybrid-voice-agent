@@ -134,6 +134,14 @@ h2 {
   color: #9a9488;
 }
 
+.module-card select:disabled,
+.llm-config textarea:disabled {
+  border-color: var(--line);
+  background: #eee6d8;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .volume-meter {
   height: 14px;
   overflow: hidden;
@@ -219,6 +227,50 @@ h2 {
 .voice-latency b {
   color: var(--ink);
   font-weight: 800;
+}
+
+.llm-config {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.34);
+}
+
+.llm-config summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-weight: 800;
+}
+
+.llm-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.llm-config label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.llm-config textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  text-transform: none;
 }
 
 .status-pill {
@@ -320,6 +372,10 @@ button:disabled {
   }
 
   .module-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .llm-config-grid {
     grid-template-columns: 1fr;
   }
 }

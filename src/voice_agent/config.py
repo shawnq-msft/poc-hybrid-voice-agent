@@ -10,10 +10,10 @@ from typing import Mapping
 LOCAL_ASR_PROVIDERS = {"foundry-local", "faster-whisper", "azure-embedded", "whisper-cpp", "vosk"}
 ASR_PROVIDER_CAPABILITIES = {
     "azure-embedded": {"inferenceMode": "streaming", "transportMode": "streaming", "vadRole": "start"},
-    "foundry-local": {"inferenceMode": "streaming", "transportMode": "batch", "vadRole": "start-end"},
-    "faster-whisper": {"inferenceMode": "batch", "transportMode": "batch", "vadRole": "start-end"},
-    "whisper-cpp": {"inferenceMode": "batch", "transportMode": "batch", "vadRole": "start-end"},
-    "vosk": {"inferenceMode": "batch", "transportMode": "batch", "vadRole": "start-end"},
+    "foundry-local": {"inferenceMode": "streaming", "transportMode": "streaming", "vadRole": "start-end"},
+    "faster-whisper": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
+    "whisper-cpp": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
+    "vosk": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
 }
 FOUNDRY_STREAMING_ASR_MODELS = {
     "nemotron-3.5-asr-streaming-0.6b": {
@@ -99,7 +99,7 @@ def discover_foundry_endpoint() -> str | None:
 class ProviderSettings:
     vad: str = "silero"
     asr: str = "foundry-local"
-    tts: str = "windows-sapi"
+    tts: str = "azure-embedded"
     llm: str = "foundry-local"
     cloud_fallback_enabled: bool = False
 
@@ -127,13 +127,14 @@ class AudioSettings:
     asr_language: str = "auto"
     faster_whisper_model: str = "tiny"
     pasco_model_key: str | None = None
-    azure_embedded_asr_locale: str = "en-GB"
+    azure_embedded_asr_locale: str = "zh-CN"
     azure_embedded_grpc_url: str = "127.0.0.1:8792"
-    azure_embedded_asr_sidecar_url: str = "ws://127.0.0.1:8791/asr"
-    azure_embedded_asr_zh_cn_model_dir: Path = Path("models/azure-embedded/asr/zh-CN/encrypted/35M")
-    azure_embedded_asr_en_gb_model_dir: Path = Path("models/azure-embedded/asr/en-GB/encrypted/v6/35M")
-    azure_embedded_tts_voice: str = "azure-embedded-zh-CN-XiaoxiaoNeuralHD"
-    azure_embedded_tts_zh_cn_model_dir: Path = Path("models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralHD")
+    azure_embedded_tts_grpc_url: str = "127.0.0.1:8793"
+    azure_embedded_asr_sidecar_url: str = "/api/azure-embedded/asr-ws"
+    azure_embedded_asr_zh_cn_model_dir: Path = Path("models/azure-embedded/asr/zh-CN/decrypted/35M")
+    azure_embedded_asr_en_gb_model_dir: Path = Path("models/azure-embedded/asr/en-GB/decrypted/v6/35M")
+    azure_embedded_tts_voice: str = "azure-embedded-zh-CN-XiaoxiaoNeuralV6"
+    azure_embedded_tts_zh_cn_model_dir: Path = Path("models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralV6")
     azure_embedded_tts_en_us_model_dir: Path = Path("models/azure-embedded/tts/en-US/AvaNeuralHDv2")
     whisper_cpp_model_path: Path = Path("models/whisper/base-q5_1.gguf")
     vosk_model_path: Path = Path("models/vosk")
@@ -173,7 +174,7 @@ class Settings:
         providers = ProviderSettings(
             vad=_env(env, "VOICE_AGENT_VAD_PROVIDER", "silero"),
             asr=_env(env, "VOICE_AGENT_ASR_PROVIDER", "foundry-local"),
-            tts=_env(env, "VOICE_AGENT_TTS_PROVIDER", "windows-sapi"),
+            tts=_env(env, "VOICE_AGENT_TTS_PROVIDER", "azure-embedded"),
             llm=_env(env, "VOICE_AGENT_LLM_PROVIDER", "foundry-local"),
             cloud_fallback_enabled=_env_bool(env, "VOICE_AGENT_CLOUD_FALLBACK_ENABLED", False),
         )
@@ -183,19 +184,24 @@ class Settings:
             asr_language=_env(env, "VOICE_AGENT_ASR_LANGUAGE", "auto"),
             faster_whisper_model=_env(env, "VOICE_AGENT_FASTER_WHISPER_MODEL", "tiny"),
             pasco_model_key=env.get("PASCO_MODEL_KEY") or None,
-            azure_embedded_asr_locale=_env(env, "VOICE_AGENT_AZURE_EMBEDDED_ASR_LOCALE", "en-GB"),
+            azure_embedded_asr_locale=_env(env, "VOICE_AGENT_AZURE_EMBEDDED_ASR_LOCALE", "zh-CN"),
             azure_embedded_grpc_url=_env(env, "VOICE_AGENT_AZURE_EMBEDDED_GRPC_URL", "127.0.0.1:8792"),
+            azure_embedded_tts_grpc_url=_env(
+                env,
+                "VOICE_AGENT_AZURE_EMBEDDED_TTS_GRPC_URL",
+                _env(env, "VOICE_AGENT_AZURE_EMBEDDED_GRPC_URL", "127.0.0.1:8793"),
+            ),
             azure_embedded_asr_sidecar_url=_env(
                 env,
                 "VOICE_AGENT_AZURE_EMBEDDED_ASR_SIDECAR_URL",
-                "ws://127.0.0.1:8791/asr",
+                "/api/azure-embedded/asr-ws",
             ),
             azure_embedded_asr_zh_cn_model_dir=_path(
                 root,
                 _env(
                     env,
                     "VOICE_AGENT_AZURE_EMBEDDED_ASR_ZH_CN_MODEL_DIR",
-                    "models/azure-embedded/asr/zh-CN/encrypted/35M",
+                    "models/azure-embedded/asr/zh-CN/decrypted/35M",
                 ),
             ),
             azure_embedded_asr_en_gb_model_dir=_path(
@@ -203,20 +209,20 @@ class Settings:
                 _env(
                     env,
                     "VOICE_AGENT_AZURE_EMBEDDED_ASR_EN_GB_MODEL_DIR",
-                    "models/azure-embedded/asr/en-GB/encrypted/v6/35M",
+                    "models/azure-embedded/asr/en-GB/decrypted/v6/35M",
                 ),
             ),
             azure_embedded_tts_voice=_env(
                 env,
                 "VOICE_AGENT_AZURE_EMBEDDED_TTS_VOICE",
-                "azure-embedded-zh-CN-XiaoxiaoNeuralHD",
+                "azure-embedded-zh-CN-XiaoxiaoNeuralV6",
             ),
             azure_embedded_tts_zh_cn_model_dir=_path(
                 root,
                 _env(
                     env,
                     "VOICE_AGENT_AZURE_EMBEDDED_TTS_ZH_CN_MODEL_DIR",
-                    "models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralHD",
+                    "models/azure-embedded/tts/zh-CN/XiaoxiaoNeuralV6",
                 ),
             ),
             azure_embedded_tts_en_us_model_dir=_path(

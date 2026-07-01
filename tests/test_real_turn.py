@@ -1,12 +1,14 @@
 import unittest
+import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import _path  # noqa: F401
 
 from voice_agent.config import Settings
 from voice_agent.providers.asr import ASRTranscript
 from voice_agent.providers.llm_foundry import ChatMessage
-from voice_agent.real_turn import AzureEmbeddedTTSClient, run_real_turn, run_text_turn
+from voice_agent.real_turn import AzureEmbeddedTTSClient, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
 
 
 class FakeASR:
@@ -27,6 +29,32 @@ class FakeTTS:
     def synthesize(self, text: str) -> bytes:
         self.text = text
         return b"RIFF....WAVE"
+
+
+class SlowStreamingLLM:
+    def __init__(self):
+        self.closed = False
+
+    async def stream(self, messages: list[ChatMessage]):
+        try:
+            yield "你好，"
+            await asyncio.Event().wait()
+        finally:
+            self.closed = True
+
+
+class SlowTTS:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def synthesize_async(self, text: str) -> bytes:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+            return b"RIFF....WAVE"
+        finally:
+            self.cancelled = True
 
 
 class FakeVAD:
@@ -118,6 +146,38 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["timingsMs"]["asr"], 120)
         self.assertEqual(llm.messages[-1].content, "streaming asr final text")
 
+    async def test_text_turn_uses_custom_prompt_and_context(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        llm = FakeLLM()
+
+        await run_text_turn(
+            settings,
+            "用户问题",
+            llm_client=llm,
+            tts_client=FakeTTS(),
+            llm_prompt="用中文简洁回答。",
+            llm_context="当前场景：本地语音助手。",
+        )
+
+        self.assertEqual([message.role for message in llm.messages], ["system", "system", "user"])
+        self.assertEqual(llm.messages[0].content, "用中文简洁回答。")
+        self.assertEqual(llm.messages[1].content, "Context:\n当前场景：本地语音助手。")
+        self.assertEqual(llm.messages[2].content, "用户问题")
+
+    async def test_text_turn_cancellation_stops_streaming_llm_and_tts(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        llm = SlowStreamingLLM()
+        tts = SlowTTS()
+
+        task = asyncio.create_task(run_text_turn(settings, "打断测试", llm_client=llm, tts_client=tts))
+        await asyncio.wait_for(tts.started.wait(), timeout=1)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(llm.closed)
+        self.assertTrue(tts.cancelled)
+
     async def test_azure_embedded_tts_client_uses_audio_settings(self):
         settings = Settings.from_env(
             {"VOICE_AGENT_TTS_PROVIDER": "azure-embedded"},
@@ -126,7 +186,35 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
 
         client = AzureEmbeddedTTSClient(settings)
 
-        self.assertEqual(client.settings.audio.azure_embedded_tts_voice, "azure-embedded-zh-CN-XiaoxiaoNeuralHD")
+        self.assertEqual(client.settings.audio.azure_embedded_tts_voice, "azure-embedded-zh-CN-XiaoxiaoNeuralV6")
+
+    async def test_warm_real_chain_emits_sequential_model_load_events(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+
+        class FakeFoundryLLM:
+            def __init__(self, settings):
+                self.settings = settings
+
+            async def complete(self, messages):
+                return "OK"
+
+        with (
+            patch("voice_agent.real_turn.warm_silero_vad"),
+            patch("voice_agent.real_turn.check_foundry_ready", new=AsyncMock(return_value={"ready": True, "models": ["llm"]})),
+            patch("voice_agent.real_turn.warm_foundry_streaming_asr", return_value={"provider": "foundry-local", "model": "asr"}),
+            patch("voice_agent.real_turn.FoundryLocalLLM", FakeFoundryLLM),
+            patch("voice_agent.real_turn._check_azure_embedded_health", return_value={"provider": "azure-embedded", "model": "tts"}),
+            patch("voice_agent.real_turn._synthesize_tts", new=AsyncMock(return_value=(b"RIFF....WAVE", "audio/wav"))),
+        ):
+            events = [event async for event in iter_warm_real_chain(settings)]
+            summary = await warm_real_chain(settings)
+
+        self.assertEqual([event["stage"] for event in events], ["vad", "asr", "llm", "tts"])
+        self.assertTrue(all(event["event"] == "model_loaded" for event in events))
+        self.assertTrue(all("latencyMs" in event for event in events))
+        self.assertIn("memoryRssMb", events[-1])
+        self.assertEqual(summary["status"], "ready")
+        self.assertIn("tts", summary["timingsMs"])
 
 
 if __name__ == "__main__":

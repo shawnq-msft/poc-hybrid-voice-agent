@@ -2,7 +2,7 @@
 
 Long-lived WebSocket sidecar for Azure Embedded Speech ASR, with the project/module name widened for future Embedded TTS support.
 
-Current status: protocol, model registry, health, model load, asset validation, and streaming ASR recognition are implemented. `/asr` starts `EmbeddedSpeechConfig` continuous recognition on `start`, writes incoming PCM frames into `PushAudioInputStream`, emits partial recognition events, and returns final text after `end`. Speech SDK embedded packages are pinned to `1.24.2` for compatibility with the current v6/35M model assets.
+Current status: protocol, model registry, health, model load, asset validation, and streaming ASR recognition are implemented. `/asr` starts `EmbeddedSpeechConfig` continuous recognition on `start`, writes incoming PCM frames into `PushAudioInputStream`, emits partial recognition events, and returns final text after `end`. Speech SDK embedded packages use the latest project-wide Speech SDK version.
 
 Run from the repository root:
 

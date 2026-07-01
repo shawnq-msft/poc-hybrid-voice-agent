@@ -12,18 +12,19 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.providers.asr, "foundry-local")
         self.assertEqual(settings.providers.llm, "foundry-local")
-        self.assertEqual(settings.providers.tts, "windows-sapi")
+        self.assertEqual(settings.providers.tts, "azure-embedded")
         self.assertFalse(settings.providers.cloud_fallback_enabled)
         self.assertEqual(settings.foundry.llm_model, "qwen2.5-0.5b-instruct-cuda-gpu:4")
         self.assertEqual(settings.foundry.asr_model, "nemotron-3.5-asr-streaming-0.6b")
         self.assertEqual(settings.audio.edge_tts_voice, "zh-CN-XiaoxiaoNeural")
         self.assertEqual(settings.audio.azure_embedded_grpc_url, "127.0.0.1:8792")
-        self.assertEqual(settings.audio.azure_embedded_tts_voice, "azure-embedded-zh-CN-XiaoxiaoNeuralHD")
-        self.assertEqual(settings.audio.azure_embedded_asr_locale, "en-GB")
-        self.assertEqual(settings.audio.azure_embedded_asr_sidecar_url, "ws://127.0.0.1:8791/asr")
+        self.assertEqual(settings.audio.azure_embedded_tts_grpc_url, "127.0.0.1:8793")
+        self.assertEqual(settings.audio.azure_embedded_tts_voice, "azure-embedded-zh-CN-XiaoxiaoNeuralV6")
+        self.assertEqual(settings.audio.azure_embedded_asr_locale, "zh-CN")
+        self.assertEqual(settings.audio.azure_embedded_asr_sidecar_url, "/api/azure-embedded/asr-ws")
         self.assertEqual(
             settings.audio.azure_embedded_asr_zh_cn_model_dir,
-            Path("C:/workspace/models/azure-embedded/asr/zh-CN/encrypted/35M"),
+            Path("C:/workspace/models/azure-embedded/asr/zh-CN/decrypted/35M"),
         )
         self.assertIsNone(settings.audio.pasco_model_key)
 
@@ -35,7 +36,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(capabilities["azure-embedded"]["transportMode"], "streaming")
         self.assertEqual(capabilities["azure-embedded"]["vadRole"], "start")
         self.assertEqual(capabilities["foundry-local"]["inferenceMode"], "streaming")
-        self.assertEqual(capabilities["foundry-local"]["transportMode"], "batch")
+        self.assertEqual(capabilities["foundry-local"]["transportMode"], "streaming")
+        self.assertEqual(capabilities["faster-whisper"]["transportMode"], "streaming")
         self.assertEqual(capabilities["faster-whisper"]["vadRole"], "start-end")
 
     def test_rejects_unknown_asr_provider(self):

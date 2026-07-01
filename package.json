@@ -1,0 +1,15 @@
+{
+  "name": "poc-hybrid-voice-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:web": "vite build",
+    "dev:web": "vite --host 127.0.0.1 --port 5173"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  }
+}

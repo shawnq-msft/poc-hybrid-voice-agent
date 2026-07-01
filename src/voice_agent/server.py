@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import queue
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +17,7 @@ except ImportError:  # pragma: no cover - create_app raises a clearer install er
 from voice_agent.config import Settings
 from voice_agent.providers.tts_windows import synthesize_sapi_wav
 from voice_agent.health import collect_health
-from voice_agent.real_turn import check_foundry_ready, run_real_turn, run_text_turn, warm_real_chain
+from voice_agent.real_turn import DEFAULT_SYSTEM_PROMPT, check_foundry_ready, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
 from voice_agent.smoke import run_smoke_turn
 
 
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None):
     if settings is None:
         load_dotenv(dotenv_path=Path.cwd() / ".env")
     resolved_settings = settings or Settings.from_env(os.environ)
+    llm_config = {"prompt": DEFAULT_SYSTEM_PROMPT, "context": ""}
     app = FastAPI(title="Hybrid Voice Agent", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -57,22 +59,147 @@ def create_app(settings: Settings | None = None):
 
     @app.get("/api/config")
     async def config() -> dict[str, object]:
-        return resolved_settings.public_summary()
+        summary = resolved_settings.public_summary()
+        summary["llmDefaults"] = dict(llm_config)
+        return summary
+
+    @app.get("/api/llm-config")
+    async def get_llm_config() -> dict[str, str]:
+        return dict(llm_config)
+
+    @app.post("/api/llm-config")
+    async def update_llm_config(payload: dict[str, str] | None = Body(default=None)) -> dict[str, str]:
+        if payload is None:
+            payload = {}
+        prompt = str(payload.get("prompt") or "").strip() or DEFAULT_SYSTEM_PROMPT
+        context = str(payload.get("context") or "")
+        llm_config["prompt"] = prompt
+        llm_config["context"] = context
+        return dict(llm_config)
 
     @app.get("/api/ready")
     async def ready() -> dict[str, object]:
         return {"foundry": await check_foundry_ready(resolved_settings)}
 
     @app.post("/api/models/load")
-    async def load_models(payload: dict[str, str] | None = Body(default=None)) -> dict[str, object]:
+    async def load_models(payload: dict[str, str] | None = Body(default=None)) -> StreamingResponse:
         request_settings = _settings_with_request_options(resolved_settings, payload or {})
+
+        async def event_stream():
+            timings: dict[str, float] = {}
+            models: dict[str, object] = {}
+            try:
+                async for event in iter_warm_real_chain(request_settings):
+                    if event.get("event") == "model_loaded":
+                        stage = str(event["stage"])
+                        timings[stage] = float(event.get("latencyMs") or 0.0)
+                        models[stage] = event.get("details", {})
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+                yield json.dumps({"event": "result", "status": "ready", "timingsMs": timings, "models": models}, ensure_ascii=False) + "\n"
+            except Exception as exc:
+                yield json.dumps({"event": "error", "type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False) + "\n"
+            finally:
+                yield json.dumps({"event": "done"}, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+    @app.websocket("/api/azure-embedded/asr-ws")
+    async def azure_embedded_asr_ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        audio_queue: queue.Queue[bytes | None] = queue.Queue()
+        event_queue: queue.Queue[dict[str, object] | None] = queue.Queue()
+        request_settings = resolved_settings
+        started = False
+        worker_task: asyncio.Task[None] | None = None
+
+        async def send_event(event: dict[str, object]) -> None:
+            await websocket.send_text(json.dumps(event, ensure_ascii=False))
+
+        def recognize_worker(locale: str, model: str) -> None:
+            try:
+                import grpc
+                from voice_agent.providers import azure_embedded_pb2 as pb
+                from voice_agent.providers import azure_embedded_pb2_grpc as pb_grpc
+            except Exception as exc:
+                event_queue.put({"type": "error", "message": str(exc)})
+                event_queue.put(None)
+                return
+
+            def requests():
+                yield pb.AsrRequest(
+                    config=pb.AsrConfig(
+                        model=model,
+                        locale=locale,
+                        sample_rate_hz=16000,
+                        channels=1,
+                        bits_per_sample=16,
+                    )
+                )
+                while True:
+                    item = audio_queue.get()
+                    if item is None:
+                        yield pb.AsrRequest(end=True)
+                        break
+                    yield pb.AsrRequest(pcm16=item)
+
+            channel = grpc.insecure_channel(request_settings.audio.azure_embedded_grpc_url)
+            try:
+                grpc.channel_ready_future(channel).result(timeout=3)
+                stub = pb_grpc.AzureEmbeddedSpeechStub(channel)
+                for event in stub.Recognize(requests(), timeout=60):
+                    event_queue.put({
+                        "type": event.type,
+                        "model": event.model,
+                        "locale": event.locale,
+                        "text": event.text,
+                        "bytes": event.bytes,
+                        "elapsedMs": event.elapsed_ms,
+                        "details": event.detail,
+                        "message": event.detail,
+                    })
+                    if event.type in {"final", "error"}:
+                        break
+            except Exception as exc:
+                event_queue.put({"type": "error", "message": str(exc)})
+            finally:
+                channel.close()
+                event_queue.put(None)
+
+        async def pump_events() -> None:
+            while True:
+                event = await asyncio.to_thread(event_queue.get)
+                if event is None:
+                    break
+                await send_event(event)
+
         try:
-            return await warm_real_chain(request_settings)
+            while True:
+                message = await websocket.receive()
+                if message.get("text") is not None:
+                    payload = json.loads(message["text"])
+                    message_type = payload.get("type")
+                    if message_type == "start":
+                        locale = str(payload.get("locale") or request_settings.audio.azure_embedded_asr_locale)
+                        model = str(payload.get("model") or f"azure-embedded-{locale}-35M")
+                        request_settings = replace(
+                            resolved_settings,
+                            audio=replace(resolved_settings.audio, azure_embedded_asr_locale=locale),
+                        )
+                        started = True
+                        worker_task = asyncio.create_task(asyncio.to_thread(recognize_worker, locale, model))
+                        asyncio.create_task(pump_events())
+                    elif message_type == "end":
+                        audio_queue.put(None)
+                        if worker_task is not None:
+                            await worker_task
+                        break
+                elif message.get("bytes") is not None:
+                    if started:
+                        audio_queue.put(message["bytes"])
+        except WebSocketDisconnect:
+            audio_queue.put(None)
         except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"type": type(exc).__name__, "message": str(exc)},
-            ) from exc
+            await send_event({"type": "error", "message": str(exc)})
 
     @app.get("/api/smoke")
     async def smoke() -> dict[str, object]:
@@ -103,6 +230,9 @@ def create_app(settings: Settings | None = None):
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
         asr_language: str | None = Form(default=None),
+        llm_model: str | None = Form(default=None),
+        llm_prompt: str | None = Form(default=None),
+        llm_context: str | None = Form(default=None),
     ) -> dict[str, object]:
         audio_bytes = await audio.read()
         request_settings = _settings_with_request_options(
@@ -113,6 +243,9 @@ def create_app(settings: Settings | None = None):
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
                 "asrLanguage": asr_language,
+                "llmModel": llm_model,
+                "llmPrompt": llm_prompt,
+                "llmContext": llm_context,
             },
         )
         try:
@@ -121,6 +254,8 @@ def create_app(settings: Settings | None = None):
                 audio_bytes,
                 filename=audio.filename or "recording.webm",
                 media_type=audio.content_type or "application/octet-stream",
+                llm_prompt=_turn_llm_prompt(llm_prompt, llm_config),
+                llm_context=_turn_llm_context(llm_context, llm_config),
             )
         except Exception as exc:
             raise HTTPException(
@@ -141,6 +276,9 @@ def create_app(settings: Settings | None = None):
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
         asr_language: str | None = Form(default=None),
+        llm_model: str | None = Form(default=None),
+        llm_prompt: str | None = Form(default=None),
+        llm_context: str | None = Form(default=None),
     ) -> StreamingResponse:
         audio_bytes = await audio.read()
         request_settings = _settings_with_request_options(
@@ -151,6 +289,9 @@ def create_app(settings: Settings | None = None):
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
                 "asrLanguage": asr_language,
+                "llmModel": llm_model,
+                "llmPrompt": llm_prompt,
+                "llmContext": llm_context,
             },
         )
 
@@ -168,6 +309,8 @@ def create_app(settings: Settings | None = None):
                         filename=audio.filename or "recording.webm",
                         media_type=audio.content_type or "application/octet-stream",
                         progress_callback=progress,
+                        llm_prompt=_turn_llm_prompt(llm_prompt, llm_config),
+                        llm_context=_turn_llm_context(llm_context, llm_config),
                     )
                     await queue.put({"event": "result", "mode": "real-audio-turn", "result": result.as_dict()})
                 except Exception as exc:
@@ -192,6 +335,10 @@ def create_app(settings: Settings | None = None):
         audio_chunks: list[bytes] = []
         filename = "recording.webm"
         media_type = "audio/webm"
+        llm_prompt = None
+        llm_context = None
+        turn_task = None
+        disconnect_task = None
         try:
             while True:
                 message = await websocket.receive()
@@ -201,10 +348,14 @@ def create_app(settings: Settings | None = None):
                         request_settings = _settings_with_request_options(resolved_settings, payload)
                         filename = payload.get("filename") or filename
                         media_type = payload.get("mediaType") or media_type
+                        llm_prompt = payload.get("llmPrompt")
+                        llm_context = payload.get("llmContext")
                     if payload.get("type") == "end":
                         break
                 elif message.get("bytes") is not None:
                     audio_chunks.append(message["bytes"])
+            if not audio_chunks:
+                raise RuntimeError("Turn stream ended without audio chunks")
 
             async def progress(event: dict[str, object]) -> None:
                 if event.get("stage") == "tts" and event.get("status") == "audio" and event.get("audioBase64"):
@@ -217,17 +368,45 @@ def create_app(settings: Settings | None = None):
                 else:
                     await websocket.send_text(json.dumps({"event": "progress", **event}, ensure_ascii=False))
 
-            result = await run_real_turn(
-                request_settings,
-                b"".join(audio_chunks),
-                filename=filename,
-                media_type=media_type,
-                progress_callback=progress,
+            async def wait_for_disconnect() -> None:
+                try:
+                    while True:
+                        await websocket.receive()
+                except (WebSocketDisconnect, RuntimeError):
+                    return
+
+            turn_task = asyncio.create_task(
+                run_real_turn(
+                    request_settings,
+                    b"".join(audio_chunks),
+                    filename=filename,
+                    media_type=media_type,
+                    progress_callback=progress,
+                    llm_prompt=_turn_llm_prompt(llm_prompt, llm_config),
+                    llm_context=_turn_llm_context(llm_context, llm_config),
+                )
             )
+            disconnect_task = asyncio.create_task(wait_for_disconnect())
+            done, pending = await asyncio.wait({turn_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done:
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
+                return
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+            result = await turn_task
             result_payload = result.as_dict()
             result_payload["tts"]["audioBase64"] = None
             await websocket.send_text(json.dumps({"event": "result", "mode": "real-audio-turn", "result": result_payload}, ensure_ascii=False))
             await websocket.send_text(json.dumps({"event": "done"}))
+        except asyncio.CancelledError:
+            if turn_task is not None:
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                await asyncio.gather(disconnect_task, return_exceptions=True)
+            return
         except WebSocketDisconnect:
             return
         except Exception as exc:
@@ -237,6 +416,9 @@ def create_app(settings: Settings | None = None):
     @app.websocket("/api/session/text-turn-ws")
     async def real_text_turn_ws(websocket: WebSocket) -> None:
         await websocket.accept()
+        turn_task = None
+        disconnect_task = None
+        disconnected = False
         try:
             message = await websocket.receive()
             if message.get("text") is None:
@@ -247,35 +429,89 @@ def create_app(settings: Settings | None = None):
             if not user_text:
                 raise RuntimeError("Text turn requires non-empty user text")
 
+            async def wait_for_disconnect() -> None:
+                try:
+                    while True:
+                        await websocket.receive()
+                except (WebSocketDisconnect, RuntimeError):
+                    return
+
+            async def safe_send_text(payload: dict[str, object]) -> None:
+                nonlocal disconnected
+                if disconnected:
+                    raise WebSocketDisconnect()
+                try:
+                    await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+                except RuntimeError as exc:
+                    disconnected = True
+                    raise WebSocketDisconnect() from exc
+
+            async def safe_send_bytes(payload: bytes) -> None:
+                nonlocal disconnected
+                if disconnected:
+                    raise WebSocketDisconnect()
+                try:
+                    await websocket.send_bytes(payload)
+                except RuntimeError as exc:
+                    disconnected = True
+                    raise WebSocketDisconnect() from exc
+
             async def progress(event: dict[str, object]) -> None:
                 if event.get("stage") == "tts" and event.get("status") == "audio" and event.get("audioBase64"):
                     audio_bytes = base64.b64decode(str(event["audioBase64"]))
                     metadata = {key: value for key, value in event.items() if key != "audioBase64"}
                     metadata["event"] = "progress"
                     metadata["bytes"] = len(audio_bytes)
-                    await websocket.send_text(json.dumps(metadata, ensure_ascii=False))
-                    await websocket.send_bytes(audio_bytes)
+                    await safe_send_text(metadata)
+                    await safe_send_bytes(audio_bytes)
                 else:
-                    await websocket.send_text(json.dumps({"event": "progress", **event}, ensure_ascii=False))
+                    await safe_send_text({"event": "progress", **event})
 
-            result = await run_text_turn(
-                request_settings,
-                user_text,
-                progress_callback=progress,
-                vad_provider=str(payload.get("vadProvider") or "browser-vad"),
-                asr_provider=str(payload.get("asrProvider") or "azure-embedded"),
-                vad_ms=_optional_float(payload.get("vadLatencyMs")),
-                asr_ms=_optional_float(payload.get("asrLatencyMs")),
+            turn_task = asyncio.create_task(
+                run_text_turn(
+                    request_settings,
+                    user_text,
+                    progress_callback=progress,
+                    vad_provider=str(payload.get("vadProvider") or "browser-vad"),
+                    asr_provider=str(payload.get("asrProvider") or "azure-embedded"),
+                    vad_ms=_optional_float(payload.get("vadLatencyMs")),
+                    asr_ms=_optional_float(payload.get("asrLatencyMs")),
+                    llm_prompt=_turn_llm_prompt(payload.get("llmPrompt"), llm_config),
+                    llm_context=_turn_llm_context(payload.get("llmContext"), llm_config),
+                )
             )
+            disconnect_task = asyncio.create_task(wait_for_disconnect())
+            done, pending = await asyncio.wait({turn_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done:
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
+                return
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+            result = await turn_task
             result_payload = result.as_dict()
             result_payload["tts"]["audioBase64"] = None
-            await websocket.send_text(json.dumps({"event": "result", "mode": "real-text-turn", "result": result_payload}, ensure_ascii=False))
-            await websocket.send_text(json.dumps({"event": "done"}))
+            await safe_send_text({"event": "result", "mode": "real-text-turn", "result": result_payload})
+            await safe_send_text({"event": "done"})
+        except asyncio.CancelledError:
+            if turn_task is not None:
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
+            if disconnect_task is not None:
+                disconnect_task.cancel()
+                await asyncio.gather(disconnect_task, return_exceptions=True)
+            return
         except WebSocketDisconnect:
+            if turn_task is not None:
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
             return
         except Exception as exc:
-            await websocket.send_text(json.dumps({"event": "error", "type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
-            await websocket.send_text(json.dumps({"event": "done"}))
+            try:
+                await safe_send_text({"event": "error", "type": type(exc).__name__, "message": str(exc)})
+                await safe_send_text({"event": "done"})
+            except WebSocketDisconnect:
+                return
 
     @app.post("/api/session/backend-check")
     async def backend_real_chain_check(payload: dict[str, str] | None = Body(default=None)) -> dict[str, object]:
@@ -287,6 +523,8 @@ def create_app(settings: Settings | None = None):
                 audio_bytes,
                 filename="backend-check.wav",
                 media_type="audio/wav",
+                llm_prompt=_turn_llm_prompt((payload or {}).get("llmPrompt"), llm_config),
+                llm_context=_turn_llm_context((payload or {}).get("llmContext"), llm_config),
             )
         except Exception as exc:
             raise HTTPException(
@@ -324,12 +562,27 @@ def _settings_with_tts_provider(settings: Settings, tts_provider: str | None) ->
     return replace(settings, providers=providers)
 
 
+def _turn_llm_prompt(value: object, llm_config: dict[str, str]) -> str:
+    prompt = str(value or "").strip()
+    return prompt or llm_config.get("prompt") or DEFAULT_SYSTEM_PROMPT
+
+
+def _turn_llm_context(value: object, llm_config: dict[str, str]) -> str:
+    if value is None:
+        return llm_config.get("context", "")
+    return str(value)
+
+
 def _settings_with_request_options(settings: Settings, options: dict[str, str | None]) -> Settings:
     updated = _settings_with_tts_provider(settings, options.get("ttsProvider"))
     asr_provider = options.get("asrProvider")
     asr_locale = options.get("asrLocale")
     asr_model = options.get("asrModel")
     asr_language = options.get("asrLanguage")
+    llm_model = options.get("llmModel")
+    if llm_model:
+        foundry = replace(updated.foundry, llm_model=llm_model)
+        updated = replace(updated, foundry=foundry)
     if asr_provider:
         providers = replace(updated.providers, asr=_normalize_asr_provider(asr_provider))
         providers.validate()
@@ -337,6 +590,9 @@ def _settings_with_request_options(settings: Settings, options: dict[str, str | 
     if asr_model and updated.providers.asr == "foundry-local":
         foundry = replace(updated.foundry, asr_model=asr_model)
         updated = replace(updated, foundry=foundry)
+    if asr_model and updated.providers.asr == "faster-whisper":
+        audio = replace(updated.audio, faster_whisper_model=asr_model)
+        updated = replace(updated, audio=audio)
     if asr_language:
         audio = replace(updated.audio, asr_language=asr_language)
         updated = replace(updated, audio=audio)

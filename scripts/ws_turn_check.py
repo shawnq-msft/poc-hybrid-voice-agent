@@ -15,7 +15,7 @@ async def main() -> None:
     audio_bytes = 0
 
     async with websockets.connect("ws://127.0.0.1:8787/api/session/turn-ws", max_size=32 * 1024 * 1024) as websocket:
-        await websocket.send(json.dumps({"type": "config", "ttsProvider": "windows-sapi", "filename": "input.wav", "mediaType": "audio/wav"}))
+        await websocket.send(json.dumps({"type": "config", "ttsProvider": "azure-embedded", "filename": "input.wav", "mediaType": "audio/wav"}))
         await websocket.send(audio)
         await websocket.send(json.dumps({"type": "end"}))
 
