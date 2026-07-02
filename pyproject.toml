@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 voice-agent = "voice_agent.server:main"
+voice-agent-pipecat = "voice_agent.pipecat_server:main"
 voice-agent-health = "voice_agent.health:main"
 
 [tool.setuptools.packages.find]

@@ -29,7 +29,7 @@ FOUNDRY_STREAMING_ASR_MODELS = {
 }
 LOCAL_TTS_PROVIDERS = {"windows-winrt", "windows-sapi", "edge-tts", "azure-speech", "azure-embedded"}
 LOCAL_VAD_PROVIDERS = {"silero", "webrtcvad", "energy"}
-LOCAL_LLM_PROVIDERS = {"foundry-local"}
+LOCAL_LLM_PROVIDERS = {"foundry-local", "llama-cpp"}
 
 
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
@@ -100,7 +100,7 @@ class ProviderSettings:
     vad: str = "silero"
     asr: str = "foundry-local"
     tts: str = "azure-embedded"
-    llm: str = "foundry-local"
+    llm: str = "llama-cpp"
     cloud_fallback_enabled: bool = False
 
     def validate(self) -> None:
@@ -119,6 +119,14 @@ class FoundrySettings:
     endpoint: str = "http://127.0.0.1:5273/v1"
     llm_model: str = "gemma-4-e2b"
     asr_model: str = "nemotron-3.5-asr-streaming-0.6b"
+    timeout_seconds: float = 180.0
+
+
+@dataclass(frozen=True)
+class LlamaCppSettings:
+    endpoint: str = "http://127.0.0.1:8080"
+    model: str = "gemma-4-e2b"
+    slot_id: int = 0
     timeout_seconds: float = 180.0
 
 
@@ -164,6 +172,7 @@ class Settings:
     base_dir: Path
     providers: ProviderSettings
     foundry: FoundrySettings
+    llama_cpp: LlamaCppSettings
     audio: AudioSettings
     copilot_tools: CopilotToolSettings
     server: ServerSettings
@@ -175,7 +184,7 @@ class Settings:
             vad=_env(env, "VOICE_AGENT_VAD_PROVIDER", "silero"),
             asr=_env(env, "VOICE_AGENT_ASR_PROVIDER", "foundry-local"),
             tts=_env(env, "VOICE_AGENT_TTS_PROVIDER", "azure-embedded"),
-            llm=_env(env, "VOICE_AGENT_LLM_PROVIDER", "foundry-local"),
+            llm=_env(env, "VOICE_AGENT_LLM_PROVIDER", "llama-cpp"),
             cloud_fallback_enabled=_env_bool(env, "VOICE_AGENT_CLOUD_FALLBACK_ENABLED", False),
         )
         providers.validate()
@@ -248,9 +257,15 @@ class Settings:
             providers=providers,
             foundry=FoundrySettings(
                 endpoint=_default_foundry_endpoint(env),
-                llm_model=_env(env, "VOICE_AGENT_FOUNDRY_LLM_MODEL", "qwen2.5-0.5b-instruct-cuda-gpu:4"),
+                llm_model=_env(env, "VOICE_AGENT_FOUNDRY_LLM_MODEL", "gemma-4-e2b"),
                 asr_model=_env(env, "VOICE_AGENT_FOUNDRY_ASR_MODEL", "nemotron-3.5-asr-streaming-0.6b"),
                 timeout_seconds=_env_float(env, "VOICE_AGENT_FOUNDRY_TIMEOUT_SECONDS", 180.0),
+            ),
+            llama_cpp=LlamaCppSettings(
+                endpoint=_env(env, "VOICE_AGENT_LLAMA_CPP_ENDPOINT", "http://127.0.0.1:8080"),
+                model=_env(env, "VOICE_AGENT_LLAMA_CPP_MODEL", "gemma-4-e2b"),
+                slot_id=_env_int(env, "VOICE_AGENT_LLAMA_CPP_SLOT_ID", 0),
+                timeout_seconds=_env_float(env, "VOICE_AGENT_LLAMA_CPP_TIMEOUT_SECONDS", 180.0),
             ),
             audio=audio,
             copilot_tools=CopilotToolSettings(
@@ -288,6 +303,11 @@ class Settings:
                 "llmModel": self.foundry.llm_model,
                 "asrModel": self.foundry.asr_model,
                 "streamingAsrModels": FOUNDRY_STREAMING_ASR_MODELS,
+            },
+            "llamaCpp": {
+                "endpoint": self.llama_cpp.endpoint,
+                "model": self.llama_cpp.model,
+                "slotId": self.llama_cpp.slot_id,
             },
             "audio": {
                 "asrLanguage": self.audio.asr_language,

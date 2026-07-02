@@ -53,7 +53,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="LLM module">
             <div className="module-heading"><span>LLM</span><strong id="llmStatus">Idle</strong></div>
-            <label>Model/API<select id="llmSelector" defaultValue="qwen2.5-0.5b-instruct-cuda-gpu:4"><option value="qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option disabled>Foundry Local model</option><option disabled>Cloud fallback</option></select></label>
+            <label>Model/API<select id="llmSelector" defaultValue="llama-cpp:gemma-4-e2b"><option value="llama-cpp:gemma-4-e2b">llama.cpp Gemma 4 E2B</option><option value="foundry-local:gemma-4-e2b">Foundry Gemma 4 E2B</option><option value="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option disabled>Cloud fallback</option></select></label>
             <dl className="latency-list">
               <div><dt>TTFT</dt><dd id="llmTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="llmAvg">-</dd></div>

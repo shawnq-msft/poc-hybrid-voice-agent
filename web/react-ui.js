@@ -8248,15 +8248,19 @@ function m() {
 									}),
 									/* @__PURE__ */ (0, p.jsxs)("label", { children: ["Model/API", /* @__PURE__ */ (0, p.jsxs)("select", {
 										id: "llmSelector",
-										defaultValue: "qwen2.5-0.5b-instruct-cuda-gpu:4",
+										defaultValue: "llama-cpp:gemma-4-e2b",
 										children: [
 											/* @__PURE__ */ (0, p.jsx)("option", {
-												value: "qwen2.5-0.5b-instruct-cuda-gpu:4",
-												children: "Foundry qwen2.5 0.5B"
+												value: "llama-cpp:gemma-4-e2b",
+												children: "llama.cpp Gemma 4 E2B"
 											}),
 											/* @__PURE__ */ (0, p.jsx)("option", {
-												disabled: !0,
-												children: "Foundry Local model"
+												value: "foundry-local:gemma-4-e2b",
+												children: "Foundry Gemma 4 E2B"
+											}),
+											/* @__PURE__ */ (0, p.jsx)("option", {
+												value: "foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4",
+												children: "Foundry qwen2.5 0.5B"
 											}),
 											/* @__PURE__ */ (0, p.jsx)("option", {
 												disabled: !0,

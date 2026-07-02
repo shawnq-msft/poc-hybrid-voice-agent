@@ -13,6 +13,22 @@ class ChatMessage:
     content: str
 
 
+@dataclass
+class PreparedFoundryLocalLLMTurn:
+    llm: "FoundryLocalLLM"
+    messages: list[ChatMessage]
+
+    def with_user_text(self, user_text: str) -> "PreparedFoundryLocalLLMTurn":
+        return PreparedFoundryLocalLLMTurn(self.llm, [*self.messages, ChatMessage("user", user_text)])
+
+    async def complete(self) -> str:
+        return await self.llm.complete(self.messages)
+
+    async def stream(self) -> AsyncIterator[str]:
+        async for token in self.llm.stream(self.messages):
+            yield token
+
+
 @dataclass(frozen=True)
 class FoundryLocalLLM:
     settings: FoundrySettings
@@ -20,6 +36,9 @@ class FoundryLocalLLM:
     @property
     def chat_url(self) -> str:
         return f"{self.settings.endpoint.rstrip('/')}/chat/completions"
+
+    async def prepare_turn(self, messages: Iterable[ChatMessage]) -> PreparedFoundryLocalLLMTurn:
+        return PreparedFoundryLocalLLMTurn(self, list(messages))
 
     async def complete(self, messages: Iterable[ChatMessage]) -> str:
         try:

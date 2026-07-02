@@ -52,7 +52,8 @@ def run_smoke_turn(settings: Settings, user_text: str = "Open Copilot and summar
         raise RuntimeError("Smoke VAD did not detect synthetic speech")
 
     transcript = ASRTranscript(text=user_text, language=settings.audio.asr_language, provider="mock-asr")
-    assistant_text = f"Smoke reply via {settings.foundry.llm_model}: {transcript.text}"
+    llm_model = settings.llama_cpp.model if settings.providers.llm == "llama-cpp" else settings.foundry.llm_model
+    assistant_text = f"Smoke reply via {llm_model}: {transcript.text}"
     tts_bytes = assistant_text.encode("utf-8")
 
     tool_result: ToolResult | None = None
@@ -83,7 +84,7 @@ def run_smoke_turn(settings: Settings, user_text: str = "Open Copilot and summar
         llm={
             "provider": "mock-llm",
             "configuredProvider": settings.providers.llm,
-            "model": settings.foundry.llm_model,
+            "model": llm_model,
         },
         tts={
             "provider": "mock-tts",

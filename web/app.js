@@ -17,6 +17,7 @@ const state = {
   sending: false,
   azureAsr: null,
   turnStream: null,
+  preparedTextTurn: null,
   responseSocket: null,
   responseTurnId: 0,
   interruptedTurnId: 0,
@@ -128,7 +129,7 @@ function syncSelectors(config) {
   updateVadSelection(false);
   setSelectByValue(asrSelector, "azure-embedded:zh-CN");
   updateAsrMetricLabel();
-  setSelectByText(llmSelector, "Foundry qwen2.5 0.5B");
+  setSelectByValue(llmSelector, "llama-cpp:gemma-4-e2b");
   setSelectByValue(ttsSelector, ["azure-embedded", "edge-tts", "windows-sapi"].includes(config.providers.tts) ? config.providers.tts : "azure-embedded");
   if (llmPromptInput) llmPromptInput.value = config.llmDefaults?.prompt || "";
   if (llmContextInput) llmContextInput.value = config.llmDefaults?.context || "";
@@ -161,8 +162,10 @@ function selectedTtsProvider() {
 }
 
 function selectedLlmOptions() {
+  const [llmProvider, ...modelParts] = llmSelector.value.split(":");
   return {
-    llmModel: llmSelector.value,
+    llmProvider,
+    llmModel: modelParts.join(":"),
     llmPrompt: llmPromptInput?.value || "",
     llmContext: llmContextInput?.value || "",
   };
@@ -177,7 +180,8 @@ function selectedLlmConfigPayload() {
 }
 
 function selectedModelOptions() {
-  return { ttsProvider: selectedTtsProvider(), ...selectedAsrOptions(), llmModel: llmSelector.value };
+  const { llmProvider, llmModel } = selectedLlmOptions();
+  return { ttsProvider: selectedTtsProvider(), ...selectedAsrOptions(), llmProvider, llmModel };
 }
 
 function currentModelSignature() {
@@ -455,6 +459,7 @@ function updateVad(volume, now) {
       state.currentTurn.streamingAsr = isStreamingAsrSelected();
       if (isAzureEmbeddedAsrSelected()) {
         startAzureAsrStream();
+        prepareTextTurnWebSocket();
       } else {
         startRecorder();
         startTurnStream();
@@ -768,25 +773,99 @@ function postTurnWebSocket(blob) {
   });
 }
 
+function prepareTextTurnWebSocket() {
+  if (state.preparedTextTurn?.active) {
+    return state.preparedTextTurn;
+  }
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${location.host}/api/session/text-turn-ws`);
+  socket.binaryType = "arraybuffer";
+  let resolveReady;
+  let rejectReady;
+  const preparedTurn = {
+    active: true,
+    ready: false,
+    socket,
+    pendingStart: null,
+    readyPromise: new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    }),
+    resolveReady,
+    rejectReady,
+  };
+  state.preparedTextTurn = preparedTurn;
+
+  socket.addEventListener("open", () => {
+    socket.send(JSON.stringify({ type: "prepare_text_turn", ...selectedRuntimeOptions() }));
+  });
+
+  socket.addEventListener("message", (message) => {
+    if (typeof message.data !== "string") {
+      return;
+    }
+    const event = JSON.parse(message.data);
+    if (event.event === "prepared") {
+      preparedTurn.ready = true;
+      preparedTurn.resolveReady(preparedTurn);
+      if (preparedTurn.pendingStart) {
+        socket.send(JSON.stringify(preparedTurn.pendingStart));
+        preparedTurn.pendingStart = null;
+      }
+    }
+  });
+  socket.addEventListener("error", () => rejectPreparedTextTurn(preparedTurn, new Error("Text turn prepare WebSocket failed")));
+  socket.addEventListener("close", () => {
+    if (state.preparedTextTurn === preparedTurn) state.preparedTextTurn = null;
+    if (!preparedTurn.ready) {
+      rejectPreparedTextTurn(preparedTurn, new Error("Text turn prepare WebSocket closed before ready"));
+    }
+  });
+  return preparedTurn;
+}
+
+function rejectPreparedTextTurn(preparedTurn, error) {
+  preparedTurn.active = false;
+  preparedTurn.rejectReady(error);
+  if (state.preparedTextTurn === preparedTurn) {
+    state.preparedTextTurn = null;
+  }
+}
+
 function postTextTurnWebSocket(text, turnId = state.responseTurnId, timings = {}) {
   return new Promise((resolve, reject) => {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}/api/session/text-turn-ws`);
+    const preparedTurn = state.preparedTextTurn?.active ? state.preparedTextTurn : null;
+    const socket = preparedTurn?.socket || new WebSocket(`${protocol}//${location.host}/api/session/text-turn-ws`);
+    if (preparedTurn && state.preparedTextTurn === preparedTurn) state.preparedTextTurn = null;
     state.responseSocket = socket;
     socket.binaryType = "arraybuffer";
     let result = null;
     let pendingAudio = null;
+    const startPayload = {
+      type: "text_turn",
+      text,
+      ...selectedRuntimeOptions(),
+      vadProvider: "browser-vad",
+      vadLatencyMs: timings.vadLatencyMs || 0,
+      asrLatencyMs: timings.asrLatencyMs || 0,
+    };
 
-    socket.addEventListener("open", () => {
-      socket.send(JSON.stringify({
-        type: "text_turn",
-        text,
-        ...selectedRuntimeOptions(),
-        vadProvider: "browser-vad",
-        vadLatencyMs: timings.vadLatencyMs || 0,
-        asrLatencyMs: timings.asrLatencyMs || 0,
-      }));
-    });
+    if (preparedTurn) {
+      preparedTurn.active = false;
+      if (preparedTurn.ready && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(startPayload));
+      } else {
+        preparedTurn.pendingStart = startPayload;
+        preparedTurn.readyPromise.catch(() => {
+          if (turnId > state.interruptedTurnId) reject(new Error("Text turn prepare failed"));
+        });
+      }
+    } else {
+      socket.addEventListener("open", () => {
+        socket.send(JSON.stringify(startPayload));
+      });
+    }
 
     socket.addEventListener("message", (message) => {
       if (typeof message.data === "string") {
@@ -826,6 +905,8 @@ function postTextTurnWebSocket(text, turnId = state.responseTurnId, timings = {}
       if (state.responseSocket === socket) state.responseSocket = null;
       if (turnId <= state.interruptedTurnId) {
         resolve(null);
+      } else if (!result) {
+        reject(new Error("Text turn WebSocket closed before completion"));
       }
     });
   });
@@ -834,7 +915,8 @@ function postTextTurnWebSocket(text, turnId = state.responseTurnId, timings = {}
 function interruptAssistantResponse() {
   const hasResponseSocket = state.responseSocket && state.responseSocket.readyState !== WebSocket.CLOSED;
   const activeTurnStream = state.turnStream?.active ? state.turnStream : null;
-  if (!hasResponseSocket && !activeTurnStream && !state.playingAudio && state.audioQueue.length === 0) {
+  const activePreparedTextTurn = state.preparedTextTurn?.active ? state.preparedTextTurn : null;
+  if (!hasResponseSocket && !activeTurnStream && !activePreparedTextTurn && !state.playingAudio && state.audioQueue.length === 0) {
     return;
   }
   state.interruptedTurnId = state.responseTurnId;
@@ -853,7 +935,16 @@ function interruptAssistantResponse() {
       // Ignore close races; the next turn owns UI state from here.
     }
   }
+  if (activePreparedTextTurn) {
+    try {
+      activePreparedTextTurn.socket.close();
+    } catch {
+      // Ignore close races; the next turn owns UI state from here.
+    }
+    rejectPreparedTextTurn(activePreparedTextTurn, new Error("Prepared text turn interrupted by speech."));
+  }
   state.responseSocket = null;
+  state.preparedTextTurn = null;
   state.audioQueue = [];
   state.playingAudio = false;
   const activeAudioUrl = remoteAudio.currentSrc || remoteAudio.src;

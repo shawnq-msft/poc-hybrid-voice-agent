@@ -14,6 +14,7 @@ from voice_agent.config import Settings
 from voice_agent.pipecat_runtime.events import ProgressCallback, emit_progress, progress_event
 from voice_agent.providers.asr import ASRTranscript, AzureEmbeddedASR, FasterWhisperASR, FoundryLocalASR, warm_faster_whisper, warm_foundry_streaming_asr
 from voice_agent.providers.llm_foundry import ChatMessage, FoundryLocalLLM
+from voice_agent.providers.llm_llama_cpp import LlamaCppLLM
 from voice_agent.providers.tts_windows import AsyncAzureEmbeddedTTSGrpcClient, synthesize_azure_embedded_wav, synthesize_edge_mp3, synthesize_sapi_wav
 from voice_agent.providers.vad import SileroVad, VadDecision, warm_silero_vad
 
@@ -31,6 +32,11 @@ class ASRClient(Protocol):
 
 class LLMClient(Protocol):
     async def complete(self, messages: list[ChatMessage]) -> str:
+        ...
+
+
+class PreparedLLMTurn(Protocol):
+    def with_user_text(self, user_text: str) -> "PreparedLLMTurn":
         ...
 
 
@@ -124,6 +130,22 @@ class AssistantTurnPayload:
     timings_ms: dict[str, float]
 
 
+@dataclass(frozen=True)
+class PreparedMessagesLLMTurn:
+    llm: object
+    messages: list[ChatMessage]
+
+    def with_user_text(self, user_text: str) -> "PreparedMessagesLLMTurn":
+        return PreparedMessagesLLMTurn(self.llm, [*self.messages, ChatMessage("user", user_text)])
+
+    async def complete(self) -> str:
+        return await self.llm.complete(self.messages)
+
+    async def stream(self) -> AsyncIterator[str]:
+        async for token in self.llm.stream(self.messages):
+            yield token
+
+
 async def run_real_turn(
     settings: Settings,
     audio_bytes: bytes,
@@ -142,7 +164,7 @@ async def run_real_turn(
         raise RuntimeError("Recorded audio is too small to transcribe")
 
     asr = asr_client or _default_asr_client(settings)
-    llm = llm_client or FoundryLocalLLM(settings.foundry)
+    llm = llm_client or _default_llm_client(settings)
     owns_tts = tts_client is None
     tts = tts_client or _default_tts_client(settings)
 
@@ -156,17 +178,33 @@ async def run_real_turn(
         raise RuntimeError("Silero VAD detected no speech")
     await _emit_progress(progress_callback, "vad", "idle", latency_ms=vad_ms)
 
+    llm_prepare_task = asyncio.create_task(prepare_llm_turn(llm, llm_prompt=llm_prompt, llm_context=llm_context))
     asr_started = perf_counter()
     await _emit_progress(progress_callback, "asr", "running")
-    transcript = await _transcribe_with_local_fallback(settings, asr, audio_bytes, filename, media_type)
-    asr_ms = _elapsed_ms(asr_started)
-    if not transcript.text.strip():
-        await _emit_progress(progress_callback, "asr", "failed", latency_ms=asr_ms)
-        raise RuntimeError("ASR returned empty text")
-    await _emit_progress(progress_callback, "asr", "idle", latency_ms=asr_ms, text=transcript.text)
+    try:
+        transcript = await _transcribe_with_local_fallback(settings, asr, audio_bytes, filename, media_type)
+        asr_ms = _elapsed_ms(asr_started)
+        if not transcript.text.strip():
+            await _emit_progress(progress_callback, "asr", "failed", latency_ms=asr_ms)
+            raise RuntimeError("ASR returned empty text")
+        await _emit_progress(progress_callback, "asr", "idle", latency_ms=asr_ms, text=transcript.text)
+    except Exception:
+        llm_prepare_task.cancel()
+        await asyncio.gather(llm_prepare_task, return_exceptions=True)
+        raise
 
     try:
-        assistant_turn = await _complete_assistant_turn(settings, transcript.text, llm, tts, progress_callback, llm_prompt=llm_prompt, llm_context=llm_context)
+        prepared_llm_turn = await llm_prepare_task
+        assistant_turn = await _complete_assistant_turn(
+            settings,
+            transcript.text,
+            llm,
+            tts,
+            progress_callback,
+            llm_prompt=llm_prompt,
+            llm_context=llm_context,
+            prepared_llm_turn=prepared_llm_turn,
+        )
     finally:
         if owns_tts and hasattr(tts, "close"):
             close_result = tts.close()
@@ -205,17 +243,20 @@ async def run_text_turn(
     asr_ms: float = 0.0,
     llm_prompt: str | None = None,
     llm_context: str | None = None,
+    prepared_llm_turn: PreparedLLMTurn | None = None,
 ) -> RealTurnResult:
     total_started = perf_counter()
     normalized_text = user_text.strip()
     if not normalized_text:
         raise RuntimeError("Text turn requires non-empty user text")
 
-    llm = llm_client or FoundryLocalLLM(settings.foundry)
+    llm = llm_client or _default_llm_client(settings)
     owns_tts = tts_client is None
     tts = tts_client or _default_tts_client(settings)
     try:
-        assistant_turn = await _complete_assistant_turn(settings, normalized_text, llm, tts, progress_callback, llm_prompt=llm_prompt, llm_context=llm_context)
+        if prepared_llm_turn is None:
+            prepared_llm_turn = await prepare_llm_turn(llm, llm_prompt=llm_prompt, llm_context=llm_context)
+        assistant_turn = await _complete_assistant_turn(settings, normalized_text, llm, tts, progress_callback, llm_prompt=llm_prompt, llm_context=llm_context, prepared_llm_turn=prepared_llm_turn)
     finally:
         if owns_tts and hasattr(tts, "close"):
             close_result = tts.close()
@@ -294,6 +335,38 @@ def _default_tts_client(settings: Settings):
     return SapiTTSClient(settings.audio.windows_tts_voice)
 
 
+def _default_llm_client(settings: Settings):
+    if settings.providers.llm == "llama-cpp":
+        return LlamaCppLLM(settings.llama_cpp)
+    if settings.providers.llm == "foundry-local":
+        return FoundryLocalLLM(settings.foundry)
+    raise RuntimeError(f"Real turn LLM provider is not implemented: {settings.providers.llm}")
+
+
+async def prepare_llm_turn(
+    llm,
+    *,
+    llm_prompt: str | None = None,
+    llm_context: str | None = None,
+) -> PreparedLLMTurn:
+    messages = _base_llm_messages(llm_prompt=llm_prompt, llm_context=llm_context)
+    if hasattr(llm, "prepare_turn"):
+        prepared = llm.prepare_turn(messages)
+        if inspect.isawaitable(prepared):
+            return await prepared
+        return prepared
+    return PreparedMessagesLLMTurn(llm, messages)
+
+
+def _base_llm_messages(*, llm_prompt: str | None = None, llm_context: str | None = None) -> list[ChatMessage]:
+    system_prompt = (llm_prompt or DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
+    messages = [ChatMessage("system", system_prompt)]
+    context = (llm_context or "").strip()
+    if context:
+        messages.append(ChatMessage("system", f"Context:\n{context}"))
+    return messages
+
+
 async def _synthesize_tts(tts, text: str) -> tuple[bytes, str]:
     if hasattr(tts, "synthesize_async"):
         audio_bytes = await tts.synthesize_async(text)
@@ -317,18 +390,14 @@ async def _complete_assistant_turn(
     progress_callback: ProgressCallback | None = None,
     llm_prompt: str | None = None,
     llm_context: str | None = None,
+    prepared_llm_turn: PreparedLLMTurn | None = None,
 ) -> AssistantTurnPayload:
-    system_prompt = (llm_prompt or DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
-    messages = [ChatMessage("system", system_prompt)]
-    context = (llm_context or "").strip()
-    if context:
-        messages.append(ChatMessage("system", f"Context:\n{context}"))
-    messages.append(ChatMessage("user", user_text))
+    llm_turn = prepared_llm_turn or await prepare_llm_turn(llm, llm_prompt=llm_prompt, llm_context=llm_context)
+    llm_turn = llm_turn.with_user_text(user_text)
     await _emit_progress(progress_callback, "llm", "running")
     assistant_text, llm_ms, llm_first_sentence_ms, llm_total_ms, tts_payload = await _run_llm_and_tts(
-        llm,
+        llm_turn,
         tts,
-        messages,
         progress_callback,
     )
     if not assistant_text.strip():
@@ -372,21 +441,20 @@ async def _complete_assistant_turn(
 
 
 async def _run_llm_and_tts(
-    llm,
+    llm_turn,
     tts,
-    messages: list[ChatMessage],
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[str, float, float, float, tuple[bytes, str, float, float]]:
-    if hasattr(llm, "stream"):
+    if hasattr(llm_turn, "stream"):
         try:
-            return await _stream_llm_and_tts(llm, tts, messages, progress_callback)
+            return await _stream_llm_and_tts(llm_turn, tts, progress_callback)
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
 
     llm_started = perf_counter()
-    assistant_text = await llm.complete(messages)
+    assistant_text = await llm_turn.complete()
     llm_ms = _elapsed_ms(llm_started)
     await _emit_progress(progress_callback, "llm", "ttft", latency_ms=llm_ms)
     await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=llm_ms)
@@ -398,9 +466,8 @@ async def _run_llm_and_tts(
 
 
 async def _stream_llm_and_tts(
-    llm,
+    llm_turn,
     tts,
-    messages: list[ChatMessage],
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[str, float, float, float, tuple[bytes, str, float, float]]:
     llm_started = perf_counter()
@@ -411,7 +478,7 @@ async def _stream_llm_and_tts(
     tts_tasks: list[asyncio.Task[tuple[bytes, str, float]]] = []
 
     try:
-        async for token in llm.stream(messages):
+        async for token in llm_turn.stream():
             if first_token_ms is None:
                 first_token_ms = _elapsed_ms(llm_started)
                 await _emit_progress(progress_callback, "llm", "ttft", latency_ms=first_token_ms)
@@ -545,6 +612,10 @@ async def check_foundry_ready(settings: Settings) -> dict[str, object]:
     }
 
 
+async def check_llama_cpp_ready(settings: Settings) -> dict[str, object]:
+    return await LlamaCppLLM(settings.llama_cpp).health()
+
+
 async def warm_real_chain(settings: Settings) -> dict[str, object]:
     timings: dict[str, float] = {}
     statuses: dict[str, object] = {}
@@ -606,13 +677,22 @@ async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, ob
 
     started = perf_counter()
     memory_before = _current_rss_bytes()
-    ready = await check_foundry_ready(settings)
-    if not ready.get("ready"):
-        raise RuntimeError(f"Foundry Local LLM is not ready: {ready.get('error')}")
-    await FoundryLocalLLM(settings.foundry).complete(
-        [ChatMessage("system", "Reply with OK only."), ChatMessage("user", "OK?")]
-    )
-    yield await emit_loaded("llm", {"provider": "foundry-local", "model": settings.foundry.llm_model, "endpoint": settings.foundry.endpoint}, started, memory_before)
+    if settings.providers.llm == "llama-cpp":
+        ready = await check_llama_cpp_ready(settings)
+        if not ready.get("ready"):
+            raise RuntimeError(f"llama.cpp LLM is not ready: {ready.get('error')}")
+        await LlamaCppLLM(settings.llama_cpp).complete(
+            [ChatMessage("system", "Reply with OK only."), ChatMessage("user", "OK?")]
+        )
+        yield await emit_loaded("llm", {"provider": "llama-cpp", "model": settings.llama_cpp.model, "endpoint": settings.llama_cpp.endpoint, "slotId": settings.llama_cpp.slot_id}, started, memory_before)
+    else:
+        ready = await check_foundry_ready(settings)
+        if not ready.get("ready"):
+            raise RuntimeError(f"Foundry Local LLM is not ready: {ready.get('error')}")
+        await FoundryLocalLLM(settings.foundry).complete(
+            [ChatMessage("system", "Reply with OK only."), ChatMessage("user", "OK?")]
+        )
+        yield await emit_loaded("llm", {"provider": "foundry-local", "model": settings.foundry.llm_model, "endpoint": settings.foundry.endpoint}, started, memory_before)
 
     started = perf_counter()
     memory_before = _current_rss_bytes()

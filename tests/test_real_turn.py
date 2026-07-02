@@ -64,6 +64,30 @@ class FakeVAD:
         return VadDecision(True, 1.0, "fake-vad")
 
 
+class SlowASR:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def transcribe_audio(self, audio_bytes, filename, media_type, language="auto"):
+        self.started.set()
+        await self.release.wait()
+        return ASRTranscript("提前准备测试", "zh", "fake-asr")
+
+
+class PreparingLLM(FakeLLM):
+    def __init__(self):
+        self.prepare_started = asyncio.Event()
+        self.prepare_can_finish = asyncio.Event()
+
+    async def prepare_turn(self, messages):
+        self.prepare_started.set()
+        await self.prepare_can_finish.wait()
+        from voice_agent.real_turn import PreparedMessagesLLMTurn
+
+        return PreparedMessagesLLMTurn(self, list(messages))
+
+
 class RealTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_turn_uses_audio_asr_llm_and_tts(self):
         settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
@@ -109,6 +133,33 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("stage") == "asr" and event.get("status") == "idle" and event.get("text") for event in events))
         self.assertTrue(any(event.get("stage") == "llm" and event.get("status") == "idle" and event.get("text") for event in events))
         self.assertTrue(any(event.get("stage") == "tts" and event.get("status") == "idle" for event in events))
+
+    async def test_real_turn_prepares_llm_during_asr(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        asr = SlowASR()
+        llm = PreparingLLM()
+        task = asyncio.create_task(
+            run_real_turn(
+                settings,
+                audio_bytes=b"0" * 4096,
+                filename="recording.webm",
+                media_type="audio/webm",
+                asr_client=asr,
+                llm_client=llm,
+                tts_client=FakeTTS(),
+                vad_client=FakeVAD(),
+            )
+        )
+
+        await asyncio.wait_for(asr.started.wait(), timeout=1)
+        await asyncio.wait_for(llm.prepare_started.wait(), timeout=1)
+        self.assertFalse(task.done())
+        llm.prepare_can_finish.set()
+        asr.release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(result.user_text, "提前准备测试")
+        self.assertEqual(llm.messages[-1].content, "提前准备测试")
 
     async def test_real_turn_rejects_tiny_audio(self):
         settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
@@ -200,9 +251,9 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("voice_agent.real_turn.warm_silero_vad"),
-            patch("voice_agent.real_turn.check_foundry_ready", new=AsyncMock(return_value={"ready": True, "models": ["llm"]})),
+            patch("voice_agent.real_turn.check_llama_cpp_ready", new=AsyncMock(return_value={"ready": True, "model": "gemma-4-e2b"})),
             patch("voice_agent.real_turn.warm_foundry_streaming_asr", return_value={"provider": "foundry-local", "model": "asr"}),
-            patch("voice_agent.real_turn.FoundryLocalLLM", FakeFoundryLLM),
+            patch("voice_agent.real_turn.LlamaCppLLM", FakeFoundryLLM),
             patch("voice_agent.real_turn._check_azure_embedded_health", return_value={"provider": "azure-embedded", "model": "tts"}),
             patch("voice_agent.real_turn._synthesize_tts", new=AsyncMock(return_value=(b"RIFF....WAVE", "audio/wav"))),
         ):
