@@ -23,7 +23,7 @@ The current implementation establishes the project structure, configuration mode
 - VAD: Silero VAD first, WebRTC VAD as an ultra-light fallback.
 - ASR: Foundry Local streaming speech models first. The current options are `nemotron-3.5-asr-streaming-0.6b` for multilingual/auto-detect and `nemotron-speech-streaming-en-0.6b` for English. `faster-whisper` remains available only as a separate local fallback implementation.
 - Azure Embedded Speech: local ASR/TTS model assets live under `models/azure-embedded`, which is ignored by Git. The model key belongs in `.env` as `PASCO_MODEL_KEY`; do not commit it.
-- LLM: Foundry Local. This machine currently has `qwen2.5-0.5b-instruct-cuda-gpu:4` available; use Gemma only if it appears in your Foundry Local catalog.
+- LLM: Foundry Local. This machine currently has `qwen2.5-0.5b-instruct-cuda-gpu:4` available; use Gemma through Foundry only if it appears in your Foundry Local catalog. For local Gemma E2B, use the downloaded GGUF with llama.cpp.
 - TTS: Azure Embedded HD voices can run through the native gRPC sidecar; Edge neural TTS and Windows SAPI remain selectable fallbacks.
 
 ## Setup
@@ -64,6 +64,29 @@ VOICE_AGENT_FOUNDRY_ASR_MODEL=nemotron-3.5-asr-streaming-0.6b
 VOICE_AGENT_FOUNDRY_TIMEOUT_SECONDS=180
 ```
 
+## llama.cpp Gemma E2B
+
+The Gemma 3n E2B instruction GGUF is ignored by Git under `models/llm/`. Download the Q4_K_M quantization from Hugging Face:
+
+```powershell
+hf download unsloth/gemma-3n-E2B-it-GGUF gemma-3n-E2B-it-Q4_K_M.gguf --local-dir models/llm/gemma-3n-e2b-it
+```
+
+Start a llama.cpp server on the endpoint used by the app:
+
+```powershell
+.\scripts\start_llama_cpp_e2b.ps1
+```
+
+The script downloads the Windows CPU `llama-server.exe` release into `models/llama-cpp/` if it is not already present, then serves the GGUF at `http://127.0.0.1:8080`. Set these values when selecting `llama-cpp` in the UI or request options:
+
+```text
+VOICE_AGENT_LLAMA_CPP_ENDPOINT=http://127.0.0.1:8080
+VOICE_AGENT_LLAMA_CPP_MODEL=gemma-3n-e2b-it
+VOICE_AGENT_LLAMA_CPP_MODEL_PATH=models/llm/gemma-3n-e2b-it/gemma-3n-E2B-it-Q4_K_M.gguf
+VOICE_AGENT_LLAMA_CPP_SLOT_ID=0
+```
+
 ## Azure Embedded Speech assets
 
 The local model assets are ignored by Git under `models/`. Keep encrypted ASR assets and extracted TTS voice folders in this layout:
@@ -97,7 +120,9 @@ VOICE_AGENT_AZURE_EMBEDDED_TTS_ZH_CN_MODEL_DIR=models/azure-embedded/tts/zh-CN/X
 VOICE_AGENT_AZURE_EMBEDDED_TTS_EN_US_MODEL_DIR=models/azure-embedded/tts/en-US/AvaNeuralHDv2
 ```
 
-Current status: ASR and TTS use native gRPC sidecars backed by Azure Speech SDK `1.47`. ASR listens on `127.0.0.1:8792`, TTS listens on `127.0.0.1:8793`, and both use `protos/azure_embedded_speech.proto`. ASR defaults to decrypted model assets; TTS defaults to `XiaoxiaoNeuralV6`.
+`PASCO_MODEL_KEY` is used for Azure Embedded ASR model decryption. Do not reuse it for TTS; set `VOICE_AGENT_AZURE_EMBEDDED_TTS_MODEL_KEY` only when the TTS package explicitly provides a separate synthesis model key.
+
+Current status: ASR and TTS use native gRPC sidecars backed by Azure Speech SDK `1.50`. ASR listens on `127.0.0.1:8792`, TTS listens on `127.0.0.1:8793`, and both use `protos/azure_embedded_speech.proto`. ASR defaults to decrypted model assets; TTS defaults to `XiaoxiaoNeuralV6`.
 
 Generate Python gRPC stubs after installing dev dependencies:
 
@@ -117,8 +142,10 @@ Run the sidecars:
 ```powershell
 $env:VOICE_AGENT_AZURE_EMBEDDED_MODEL_ROOT = 'models/azure-embedded'
 .\native\azure_embedded_speech_grpc\build\Release\azure_embedded_speech_grpc.exe
-.\native\azure_embedded_speech_grpc\build\tts\Release\azure_embedded_tts_grpc.exe
+.\scripts\start_azure_embedded_tts.ps1
 ```
+
+The TTS helper starts `azure_embedded_tts_grpc.exe` as a detached process, writes `azure_embedded_tts.out.log` and `azure_embedded_tts.err.log`, and runs a short synthesis smoke by default.
 
 Validate it:
 

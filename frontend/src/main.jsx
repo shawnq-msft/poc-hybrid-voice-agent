@@ -12,3 +12,5 @@ if (!rootElement) {
 flushSync(() => {
   createRoot(rootElement).render(<VoiceAgentApp />);
 });
+
+import("./browserRuntime.js");

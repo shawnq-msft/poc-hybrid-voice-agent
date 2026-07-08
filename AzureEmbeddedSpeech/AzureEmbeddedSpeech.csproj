@@ -5,7 +5,7 @@
     <RootNamespace>AzureEmbeddedSpeech</RootNamespace>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <SpeechSdkVersion>1.47.0</SpeechSdkVersion>
+    <SpeechSdkVersion>1.50.0</SpeechSdkVersion>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="$(SpeechSdkVersion)" />

@@ -100,7 +100,7 @@ class ProviderSettings:
     vad: str = "silero"
     asr: str = "foundry-local"
     tts: str = "azure-embedded"
-    llm: str = "llama-cpp"
+    llm: str = "foundry-local"
     cloud_fallback_enabled: bool = False
 
     def validate(self) -> None:
@@ -117,7 +117,7 @@ class ProviderSettings:
 @dataclass(frozen=True)
 class FoundrySettings:
     endpoint: str = "http://127.0.0.1:5273/v1"
-    llm_model: str = "gemma-4-e2b"
+    llm_model: str = "qwen2.5-0.5b-instruct-cuda-gpu:4"
     asr_model: str = "nemotron-3.5-asr-streaming-0.6b"
     timeout_seconds: float = 180.0
 
@@ -125,7 +125,8 @@ class FoundrySettings:
 @dataclass(frozen=True)
 class LlamaCppSettings:
     endpoint: str = "http://127.0.0.1:8080"
-    model: str = "gemma-4-e2b"
+    model: str = "gemma-3n-e2b-it"
+    model_path: Path = Path("models/llm/gemma-3n-e2b-it/gemma-3n-E2B-it-Q4_K_M.gguf")
     slot_id: int = 0
     timeout_seconds: float = 180.0
 
@@ -184,7 +185,7 @@ class Settings:
             vad=_env(env, "VOICE_AGENT_VAD_PROVIDER", "silero"),
             asr=_env(env, "VOICE_AGENT_ASR_PROVIDER", "foundry-local"),
             tts=_env(env, "VOICE_AGENT_TTS_PROVIDER", "azure-embedded"),
-            llm=_env(env, "VOICE_AGENT_LLM_PROVIDER", "llama-cpp"),
+            llm=_env(env, "VOICE_AGENT_LLM_PROVIDER", "foundry-local"),
             cloud_fallback_enabled=_env_bool(env, "VOICE_AGENT_CLOUD_FALLBACK_ENABLED", False),
         )
         providers.validate()
@@ -257,13 +258,14 @@ class Settings:
             providers=providers,
             foundry=FoundrySettings(
                 endpoint=_default_foundry_endpoint(env),
-                llm_model=_env(env, "VOICE_AGENT_FOUNDRY_LLM_MODEL", "gemma-4-e2b"),
+                llm_model=_env(env, "VOICE_AGENT_FOUNDRY_LLM_MODEL", "qwen2.5-0.5b-instruct-cuda-gpu:4"),
                 asr_model=_env(env, "VOICE_AGENT_FOUNDRY_ASR_MODEL", "nemotron-3.5-asr-streaming-0.6b"),
                 timeout_seconds=_env_float(env, "VOICE_AGENT_FOUNDRY_TIMEOUT_SECONDS", 180.0),
             ),
             llama_cpp=LlamaCppSettings(
                 endpoint=_env(env, "VOICE_AGENT_LLAMA_CPP_ENDPOINT", "http://127.0.0.1:8080"),
-                model=_env(env, "VOICE_AGENT_LLAMA_CPP_MODEL", "gemma-4-e2b"),
+                model=_env(env, "VOICE_AGENT_LLAMA_CPP_MODEL", "gemma-3n-e2b-it"),
+                model_path=_path(root, _env(env, "VOICE_AGENT_LLAMA_CPP_MODEL_PATH", "models/llm/gemma-3n-e2b-it/gemma-3n-E2B-it-Q4_K_M.gguf")),
                 slot_id=_env_int(env, "VOICE_AGENT_LLAMA_CPP_SLOT_ID", 0),
                 timeout_seconds=_env_float(env, "VOICE_AGENT_LLAMA_CPP_TIMEOUT_SECONDS", 180.0),
             ),
@@ -307,6 +309,7 @@ class Settings:
             "llamaCpp": {
                 "endpoint": self.llama_cpp.endpoint,
                 "model": self.llama_cpp.model,
+                "modelPath": str(self.llama_cpp.model_path),
                 "slotId": self.llama_cpp.slot_id,
             },
             "audio": {

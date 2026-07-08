@@ -101,6 +101,7 @@ class RealTurnResult:
     audio_base64: str | None
     browser_tts_fallback: bool
     timings_ms: dict[str, float]
+    tts_voice: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -112,6 +113,7 @@ class RealTurnResult:
             "llm": {"provider": self.llm_provider},
             "tts": {
                 "provider": self.tts_provider,
+                "voice": self.tts_voice,
                 "audioMediaType": self.audio_media_type,
                 "audioBase64": self.audio_base64,
                 "browserFallback": self.browser_tts_fallback,
@@ -124,6 +126,7 @@ class RealTurnResult:
 class AssistantTurnPayload:
     assistant_text: str
     tts_provider: str
+    tts_voice: str | None
     audio_media_type: str | None
     audio_base64: str | None
     browser_tts_fallback: bool
@@ -228,6 +231,7 @@ async def run_real_turn(
             **assistant_turn.timings_ms,
             "backendTotal": _elapsed_ms(total_started),
         },
+        tts_voice=assistant_turn.tts_voice,
     )
 
 
@@ -279,6 +283,7 @@ async def run_text_turn(
             **assistant_turn.timings_ms,
             "backendTotal": _elapsed_ms(total_started),
         },
+        tts_voice=assistant_turn.tts_voice,
     )
 
 
@@ -296,6 +301,7 @@ async def _emit_progress(
     total_ms: float | None = None,
     audio_base64: str | None = None,
     audio_media_type: str | None = None,
+    voice: str | None = None,
 ) -> None:
     await emit_progress(
         progress_callback,
@@ -303,6 +309,7 @@ async def _emit_progress(
             module,
             phase,
             text=text,
+            voice=voice,
             latency_ms=latency_ms,
             total_ms=total_ms,
             audio_base64=audio_base64,
@@ -335,6 +342,17 @@ def _default_tts_client(settings: Settings):
     return SapiTTSClient(settings.audio.windows_tts_voice)
 
 
+def _tts_voice_for_settings(settings: Settings, tts_provider: str | None = None) -> str | None:
+    provider = tts_provider or settings.providers.tts
+    if provider == "azure-embedded":
+        return settings.audio.azure_embedded_tts_voice
+    if provider == "edge-tts":
+        return settings.audio.edge_tts_voice
+    if provider == "windows-sapi":
+        return settings.audio.windows_tts_voice
+    return None
+
+
 def _default_llm_client(settings: Settings):
     if settings.providers.llm == "llama-cpp":
         return LlamaCppLLM(settings.llama_cpp)
@@ -359,8 +377,8 @@ async def prepare_llm_turn(
 
 
 def _base_llm_messages(*, llm_prompt: str | None = None, llm_context: str | None = None) -> list[ChatMessage]:
-    system_prompt = (llm_prompt or DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
-    messages = [ChatMessage("system", system_prompt)]
+    system_prompt = (llm_prompt or "").strip()
+    messages = [ChatMessage("system", system_prompt)] if system_prompt else []
     context = (llm_context or "").strip()
     if context:
         messages.append(ChatMessage("system", f"Context:\n{context}"))
@@ -398,6 +416,7 @@ async def _complete_assistant_turn(
     assistant_text, llm_ms, llm_first_sentence_ms, llm_total_ms, tts_payload = await _run_llm_and_tts(
         llm_turn,
         tts,
+        settings,
         progress_callback,
     )
     if not assistant_text.strip():
@@ -409,13 +428,15 @@ async def _complete_assistant_turn(
     audio_media_type = None
     browser_tts_fallback = False
     tts_provider = settings.providers.tts
+    tts_voice = _tts_voice_for_settings(settings, tts_provider)
     try:
         audio_bytes, audio_media_type, tts_ms, tts_total_ms = tts_payload
         audio_base64 = base64.b64encode(audio_bytes).decode("ascii")
-        await _emit_progress(progress_callback, "tts", "idle", latency_ms=tts_ms, total_ms=tts_total_ms)
+        await _emit_progress(progress_callback, "tts", "idle", latency_ms=tts_ms, total_ms=tts_total_ms, voice=tts_voice)
     except Exception:
         browser_tts_fallback = True
         tts_provider = "browser-speechSynthesis-fallback"
+        tts_voice = None
         tts_started = perf_counter()
         await _emit_progress(progress_callback, "tts", "running")
         audio_bytes, audio_media_type = await _synthesize_tts(tts, assistant_text)
@@ -427,6 +448,7 @@ async def _complete_assistant_turn(
     return AssistantTurnPayload(
         assistant_text=assistant_text,
         tts_provider=tts_provider,
+        tts_voice=tts_voice,
         audio_media_type=audio_media_type,
         audio_base64=audio_base64,
         browser_tts_fallback=browser_tts_fallback,
@@ -443,11 +465,12 @@ async def _complete_assistant_turn(
 async def _run_llm_and_tts(
     llm_turn,
     tts,
+    settings: Settings,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[str, float, float, float, tuple[bytes, str, float, float]]:
     if hasattr(llm_turn, "stream"):
         try:
-            return await _stream_llm_and_tts(llm_turn, tts, progress_callback)
+            return await _stream_llm_and_tts(llm_turn, tts, settings, progress_callback)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -468,6 +491,7 @@ async def _run_llm_and_tts(
 async def _stream_llm_and_tts(
     llm_turn,
     tts,
+    settings: Settings,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[str, float, float, float, tuple[bytes, str, float, float]]:
     llm_started = perf_counter()
@@ -496,19 +520,19 @@ async def _stream_llm_and_tts(
                         first_sentence_ms = _elapsed_ms(llm_started)
                         await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
                     await _emit_progress(progress_callback, "tts", "running", text=segment)
-                    tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, segment, progress_callback)))
+                    tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(settings, tts, segment, progress_callback)))
 
         if pending_text.strip():
             if first_sentence_ms is None:
                 first_sentence_ms = _elapsed_ms(llm_started)
                 await _emit_progress(progress_callback, "llm", "first_sentence", latency_ms=first_sentence_ms)
-            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, pending_text.strip(), progress_callback)))
+            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(settings, tts, pending_text.strip(), progress_callback)))
 
         assistant_text = "".join(assistant_parts).strip()
         if not assistant_text:
             raise RuntimeError("LLM stream returned empty text")
         if not tts_tasks:
-            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(tts, assistant_text, progress_callback)))
+            tts_tasks.append(asyncio.create_task(_timed_synthesize_tts(settings, tts, assistant_text, progress_callback)))
 
         tts_results = [await task for task in tts_tasks]
         first_tts_ms = tts_results[0][2]
@@ -532,6 +556,7 @@ async def _stream_llm_and_tts(
 
 
 async def _timed_synthesize_tts(
+    settings: Settings,
     tts,
     text: str,
     progress_callback: ProgressCallback | None = None,
@@ -547,6 +572,7 @@ async def _timed_synthesize_tts(
         audio_media_type=audio_media_type,
         audio_base64=base64.b64encode(audio_bytes).decode("ascii"),
         text=text,
+        voice=_tts_voice_for_settings(settings),
     )
     return audio_bytes, audio_media_type, latency_ms
 
@@ -584,7 +610,7 @@ async def _transcribe_with_local_fallback(
         )
 
 
-async def check_foundry_ready(settings: Settings) -> dict[str, object]:
+async def check_foundry_ready(settings: Settings, *, require_llm_model: bool = True) -> dict[str, object]:
     try:
         import httpx
     except ImportError:
@@ -603,12 +629,17 @@ async def check_foundry_ready(settings: Settings) -> dict[str, object]:
         model_id = item.get("id") if isinstance(item, dict) else None
         if isinstance(model_id, str):
             model_ids.append(model_id)
+    configured_llm_model_available = settings.foundry.llm_model in model_ids
     return {
-        "ready": True,
+        "ready": configured_llm_model_available if require_llm_model else True,
+        "serviceReady": True,
         "endpoint": settings.foundry.endpoint,
         "models": model_ids,
+        "availableLlmModels": model_ids,
         "llmModelConfigured": settings.foundry.llm_model,
+        "llmModelAvailable": configured_llm_model_available,
         "asrModelConfigured": settings.foundry.asr_model,
+        **({} if configured_llm_model_available or not require_llm_model else {"error": f"Configured Foundry LLM model is not loaded: {settings.foundry.llm_model}"}),
     }
 
 
@@ -653,6 +684,8 @@ async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, ob
             "details": details,
         }
 
+    await _preflight_llm(settings)
+
     started = perf_counter()
     memory_before = _current_rss_bytes()
     await asyncio.to_thread(warm_silero_vad)
@@ -661,7 +694,7 @@ async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, ob
     started = perf_counter()
     memory_before = _current_rss_bytes()
     if settings.providers.asr == "foundry-local":
-        ready = await check_foundry_ready(settings)
+        ready = await check_foundry_ready(settings, require_llm_model=False)
         if not ready.get("ready"):
             raise RuntimeError(f"Foundry Local ASR is not ready: {ready.get('error')}")
         asr_status = await asyncio.to_thread(warm_foundry_streaming_asr, settings.foundry.asr_model)
@@ -706,6 +739,17 @@ async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, ob
         await _synthesize_tts(_default_tts_client(settings), "Ready.")
         tts_voice = settings.audio.edge_tts_voice if settings.providers.tts == "edge-tts" else settings.audio.windows_tts_voice
         yield await emit_loaded("tts", {"provider": settings.providers.tts, "voice": tts_voice}, started, memory_before)
+
+
+async def _preflight_llm(settings: Settings) -> None:
+    if settings.providers.llm == "foundry-local":
+        ready = await check_foundry_ready(settings)
+        if not ready.get("ready"):
+            raise RuntimeError(f"Foundry Local LLM is not ready: {ready.get('error')}")
+    elif settings.providers.llm == "llama-cpp":
+        ready = await check_llama_cpp_ready(settings)
+        if not ready.get("ready"):
+            raise RuntimeError(f"llama.cpp LLM is not ready: {ready.get('error')}")
 
 
 def _current_rss_bytes() -> int:

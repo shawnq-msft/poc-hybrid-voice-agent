@@ -5,8 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
-set(SPEECHSDK_NUGET_VERSION "1.47.0" CACHE STRING "Microsoft Cognitive Services Speech NuGet package version")
-set(SPEECHSDK_API_VERSION "1.47" CACHE STRING "Speech SDK version label compiled into the native sidecar")
+set(SPEECHSDK_NUGET_VERSION "1.50.0" CACHE STRING "Microsoft Cognitive Services Speech NuGet package version")
+set(SPEECHSDK_API_VERSION "1.50" CACHE STRING "Speech SDK version label compiled into the native sidecar")
 
 function(set_speechsdk_package_root variable package version suffix description)
   if(NOT DEFINED ENV{USERPROFILE})
@@ -173,18 +173,33 @@ add_executable(azure_embedded_speech_grpc_preload_registry_test
   ${GENERATED_DIR}/azure_embedded_speech.grpc.pb.cc
 )
 
+add_executable(azure_embedded_tts_grpc_voice_routing_test
+  tests/tts_voice_routing_test.cpp
+  ${GENERATED_DIR}/azure_embedded_speech.pb.cc
+  ${GENERATED_DIR}/azure_embedded_speech.grpc.pb.cc
+)
+
 target_include_directories(azure_embedded_speech_grpc_preload_registry_test PRIVATE ${GENERATED_DIR})
 target_compile_definitions(azure_embedded_speech_grpc_preload_registry_test PRIVATE SPEECHSDK_VERSION="${SPEECHSDK_API_VERSION}")
 target_link_libraries(azure_embedded_speech_grpc_preload_registry_test PRIVATE gRPC::grpc++ protobuf::libprotobuf)
+target_include_directories(azure_embedded_tts_grpc_voice_routing_test PRIVATE ${GENERATED_DIR})
+target_compile_definitions(azure_embedded_tts_grpc_voice_routing_test PRIVATE SPEECHSDK_VERSION="${SPEECHSDK_API_VERSION}")
+target_link_libraries(azure_embedded_tts_grpc_voice_routing_test PRIVATE gRPC::grpc++ protobuf::libprotobuf)
 
 if(DEFINED SPEECHSDK_ROOT)
   target_include_directories(azure_embedded_speech_grpc_preload_registry_test PRIVATE
     ${SPEECHSDK_ROOT}/include/c_api
     ${SPEECHSDK_ROOT}/include/cxx_api
   )
+  target_include_directories(azure_embedded_tts_grpc_voice_routing_test PRIVATE
+    ${SPEECHSDK_ROOT}/include/c_api
+    ${SPEECHSDK_ROOT}/include/cxx_api
+  )
   if(WIN32)
     target_link_directories(azure_embedded_speech_grpc_preload_registry_test PRIVATE ${SPEECHSDK_ROOT}/x64/Release)
     target_link_libraries(azure_embedded_speech_grpc_preload_registry_test PRIVATE Microsoft.CognitiveServices.Speech.core)
+    target_link_directories(azure_embedded_tts_grpc_voice_routing_test PRIVATE ${SPEECHSDK_ROOT}/x64/Release)
+    target_link_libraries(azure_embedded_tts_grpc_voice_routing_test PRIVATE Microsoft.CognitiveServices.Speech.core)
   endif()
 endif()
 
@@ -195,12 +210,24 @@ if(WIN32)
     Microsoft.CognitiveServices.Speech.extension.embedded.tts
     Microsoft.CognitiveServices.Speech.extension.onnxruntime
   )
+  target_link_directories(azure_embedded_tts_grpc_voice_routing_test PRIVATE ${SPEECHSDK_EXTENSION_LIB_DIRS})
+  target_link_libraries(azure_embedded_tts_grpc_voice_routing_test PRIVATE
+    Microsoft.CognitiveServices.Speech.extension.embedded.tts
+    Microsoft.CognitiveServices.Speech.extension.onnxruntime
+  )
   add_custom_command(TARGET azure_embedded_speech_grpc_preload_registry_test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "$ENV{USERPROFILE}/.nuget/packages/microsoft.cognitiveservices.speech/${SPEECHSDK_NUGET_VERSION}/runtimes/win-x64/native/Microsoft.CognitiveServices.Speech.core.dll"
       ${SPEECHSDK_EXTENSION_DLLS}
       $<TARGET_FILE_DIR:azure_embedded_speech_grpc_preload_registry_test>
   )
+  add_custom_command(TARGET azure_embedded_tts_grpc_voice_routing_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$ENV{USERPROFILE}/.nuget/packages/microsoft.cognitiveservices.speech/${SPEECHSDK_NUGET_VERSION}/runtimes/win-x64/native/Microsoft.CognitiveServices.Speech.core.dll"
+      ${SPEECHSDK_EXTENSION_DLLS}
+      $<TARGET_FILE_DIR:azure_embedded_tts_grpc_voice_routing_test>
+  )
 endif()
 
 add_test(NAME azure_embedded_speech_grpc_preload_registry COMMAND azure_embedded_speech_grpc_preload_registry_test)
+add_test(NAME azure_embedded_tts_grpc_voice_routing COMMAND azure_embedded_tts_grpc_voice_routing_test)

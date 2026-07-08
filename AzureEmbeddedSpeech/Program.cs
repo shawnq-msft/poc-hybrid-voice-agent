@@ -59,15 +59,14 @@ public sealed class ModelRegistry
             "zh-CN",
             ResolveModelDir(
                 Environment.GetEnvironmentVariable("VOICE_AGENT_AZURE_EMBEDDED_ASR_ZH_CN_MODEL_DIR"),
-                Path.Combine(root, "asr", "zh-CN", "encrypted", "35M")),
+                Path.Combine(root, "asr", "zh-CN", "decrypted", "35M")),
             key));
         Register(new ModelInfo(
             "azure-embedded-en-GB-35M",
             "en-GB",
             ResolveModelDir(
                 Environment.GetEnvironmentVariable("VOICE_AGENT_AZURE_EMBEDDED_ASR_EN_GB_MODEL_DIR"),
-                Path.Combine(root, "asr", "en-GB", "encrypted", "v6", "35M"),
-                Path.Combine(root, "asr", "en-GB", "encrypted", "35M")),
+                Path.Combine(root, "asr", "en-GB", "decrypted", "v6", "35M")),
             key));
     }
 

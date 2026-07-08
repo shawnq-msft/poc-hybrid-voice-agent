@@ -6,6 +6,9 @@ __pycache__/
 .ruff_cache/
 .env
 .voice-agent/
+*.out.log
+*.err.log
+src/*.egg-info/
 models/
 dist/
 build/

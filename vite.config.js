@@ -18,6 +18,7 @@ export default defineConfig({
     },
     rollupOptions: {
       output: {
+        inlineDynamicImports: true,
         assetFileNames: "react-[name][extname]",
       },
     },

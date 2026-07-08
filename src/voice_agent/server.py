@@ -52,7 +52,7 @@ def create_app(
         runner = text_turn_runner or run_text_turn
         return await runner(*args, **kwargs)
 
-    llm_config = {"prompt": DEFAULT_SYSTEM_PROMPT, "context": ""}
+    llm_config = {"prompt": "", "context": ""}
     app = FastAPI(title=app_title, version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -89,7 +89,7 @@ def create_app(
     async def update_llm_config(payload: dict[str, str] | None = Body(default=None)) -> dict[str, str]:
         if payload is None:
             payload = {}
-        prompt = str(payload.get("prompt") or "").strip() or DEFAULT_SYSTEM_PROMPT
+        prompt = str(payload.get("prompt") or "").strip()
         context = str(payload.get("context") or "")
         llm_config["prompt"] = prompt
         llm_config["context"] = context
@@ -264,6 +264,7 @@ def create_app(
     async def real_audio_turn(
         audio: UploadFile = File(...),
         tts_provider: str | None = Form(default=None),
+        tts_voice: str | None = Form(default=None),
         asr_provider: str | None = Form(default=None),
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
@@ -277,6 +278,7 @@ def create_app(
             resolved_settings,
             {
                 "ttsProvider": tts_provider,
+                "ttsVoice": tts_voice,
                 "asrProvider": asr_provider,
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
@@ -310,6 +312,7 @@ def create_app(
     async def real_audio_turn_events(
         audio: UploadFile = File(...),
         tts_provider: str | None = Form(default=None),
+        tts_voice: str | None = Form(default=None),
         asr_provider: str | None = Form(default=None),
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
@@ -323,6 +326,7 @@ def create_app(
             resolved_settings,
             {
                 "ttsProvider": tts_provider,
+                "ttsVoice": tts_voice,
                 "asrProvider": asr_provider,
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
@@ -618,9 +622,17 @@ def _settings_with_tts_provider(settings: Settings, tts_provider: str | None) ->
     return replace(settings, providers=providers)
 
 
+def _settings_with_tts_voice(settings: Settings, tts_voice: str | None) -> Settings:
+    voice = str(tts_voice or "").strip()
+    if not voice:
+        return settings
+    audio = replace(settings.audio, azure_embedded_tts_voice=voice)
+    return replace(settings, audio=audio)
+
+
 def _turn_llm_prompt(value: object, llm_config: dict[str, str]) -> str:
     prompt = str(value or "").strip()
-    return prompt or llm_config.get("prompt") or DEFAULT_SYSTEM_PROMPT
+    return prompt or llm_config.get("prompt", "")
 
 
 def _turn_llm_context(value: object, llm_config: dict[str, str]) -> str:
@@ -631,6 +643,7 @@ def _turn_llm_context(value: object, llm_config: dict[str, str]) -> str:
 
 def _settings_with_request_options(settings: Settings, options: dict[str, str | None]) -> Settings:
     updated = _settings_with_tts_provider(settings, options.get("ttsProvider"))
+    updated = _settings_with_tts_voice(updated, options.get("ttsVoice"))
     asr_provider = options.get("asrProvider")
     asr_locale = options.get("asrLocale")
     asr_model = options.get("asrModel")

@@ -63,6 +63,8 @@ struct TtsRuntime {
   std::int64_t warmup_elapsed_ms = 0;
   std::string detail;
   std::shared_ptr<speech::SpeechConfig> speech_config;
+  std::shared_ptr<speech::EmbeddedSpeechConfig> embedded_config;
+  std::shared_ptr<speech::HybridSpeechConfig> hybrid_config;
   std::shared_ptr<speech::SpeechSynthesizer> synthesizer;
 };
 
@@ -109,6 +111,8 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
         std::ostringstream detail;
         detail << "present; sdk=" << SPEECHSDK_VERSION
                << "; offline_voice=" << runtime->model.offline_voice
+           << "; config=" << (runtime->hybrid_config ? "hybrid_embedded" : "not_prepared")
+           << "; embedded_path=" << runtime->model.path
                << "; resident=" << (runtime->prepared ? "yes" : "no")
                << "; prepare_ms=" << runtime->prepare_elapsed_ms
                << "; warmup=" << (runtime->warmup_ok ? "ok" : "not_run")
@@ -122,8 +126,8 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
 
   grpc::Status Synthesize(grpc::ServerContext*, const azurepb::TtsRequest* request, azurepb::TtsResponse* response) override {
     const auto started = std::chrono::steady_clock::now();
-    const auto voice = request->voice().empty() ? std::string("azure-embedded-zh-CN-XiaoxiaoNeuralV6") : request->voice();
-    const auto locale = request->locale().empty() ? std::string("zh-CN") : request->locale();
+    const auto voice = request->voice().empty() ? default_voice_ : request->voice();
+    const auto locale = request->locale().empty() ? std::string() : request->locale();
     const auto runtime = find_model(voice, locale);
     if (!runtime) {
       return grpc::Status(grpc::StatusCode::NOT_FOUND, "Unknown Azure Embedded TTS voice or locale: " + voice + " / " + locale);
@@ -163,7 +167,10 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
  private:
   std::shared_ptr<TtsRuntime> find_model(const std::string& id, const std::string& locale) const {
     for (const auto& runtime : models_) {
-      if (runtime->model.id == id || runtime->model.locale == locale) return runtime;
+      if (!id.empty() && runtime->model.id == id) return runtime;
+    }
+    for (const auto& runtime : models_) {
+      if (!locale.empty() && runtime->model.locale == locale) return runtime;
     }
     return {};
   }
@@ -184,8 +191,8 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
   void prepare_runtime(TtsRuntime& runtime, bool warmup) const {
     if (runtime.prepared) return;
     const auto started = std::chrono::steady_clock::now();
-    runtime.speech_config = make_tts_config(runtime.model);
-    runtime.synthesizer = speech::SpeechSynthesizer::FromConfig(runtime.speech_config, nullptr);
+    make_tts_configs(runtime);
+    runtime.synthesizer = speech::SpeechSynthesizer::FromConfig(runtime.hybrid_config, nullptr);
     runtime.prepared = true;
     runtime.prepare_elapsed_ms = elapsed_ms(started);
     if (warmup) {
@@ -201,7 +208,8 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
     }
   }
 
-  std::shared_ptr<speech::SpeechConfig> make_tts_config(const TtsModel& model) const {
+  void make_tts_configs(TtsRuntime& runtime) const {
+    const auto& model = runtime.model;
     const auto subscription = env_or("AZURE_SPEECH_KEY", env_or("SPEECH_KEY", "unused"));
     const auto region = env_or("AZURE_SPEECH_REGION", env_or("SPEECH_REGION", "eastus"));
     auto speech_config = speech::SpeechConfig::FromSubscription(subscription, region);
@@ -212,7 +220,7 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
     speech_config->SetProperty(speech::PropertyId::SpeechServiceConnection_SynthBackend, env_or("VOICE_AGENT_AZURE_EMBEDDED_TTS_BACKEND", "hybrid"));
     speech_config->SetProperty(speech::PropertyId::SpeechServiceConnection_SynthOfflineDataPath, model.path);
     speech_config->SetProperty(speech::PropertyId::SpeechServiceConnection_SynthOfflineVoice, model.offline_voice);
-    const auto model_key = env_or("VOICE_AGENT_AZURE_EMBEDDED_TTS_MODEL_KEY", env_or("PASCO_MODEL_KEY", ""));
+    const auto model_key = env_or("VOICE_AGENT_AZURE_EMBEDDED_TTS_MODEL_KEY", "");
     if (!model_key.empty()) {
       speech_config->SetProperty(speech::PropertyId::SpeechServiceConnection_SynthModelKey, model_key);
     }
@@ -225,8 +233,17 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
     }
 
     auto embedded_config = speech::EmbeddedSpeechConfig::FromPath(model.path);
-    (void)embedded_config;
-    return speech_config;
+    embedded_config->SetSpeechSynthesisVoice(model.offline_voice, model_key);
+    embedded_config->SetSpeechSynthesisOutputFormat(speech::SpeechSynthesisOutputFormat::Riff24Khz16BitMonoPcm);
+
+    auto hybrid_config = speech::HybridSpeechConfig::FromConfigs(speech_config, embedded_config);
+    hybrid_config->SetSpeechSynthesisOutputFormat(speech::SpeechSynthesisOutputFormat::Riff24Khz16BitMonoPcm);
+    hybrid_config->SetProperty(speech::PropertyId::SpeechServiceConnection_SynthBackend, env_or("VOICE_AGENT_AZURE_EMBEDDED_TTS_BACKEND", "hybrid"));
+    hybrid_config->SetProperty("SPEECH-SynthBackendSwitchingPolicy", env_or("VOICE_AGENT_AZURE_EMBEDDED_TTS_POLICY", "force_offline"));
+
+    runtime.speech_config = speech_config;
+    runtime.embedded_config = embedded_config;
+    runtime.hybrid_config = hybrid_config;
   }
 
   static std::int64_t elapsed_ms(std::chrono::steady_clock::time_point started) {
@@ -242,6 +259,7 @@ class AzureEmbeddedTtsService final : public azurepb::AzureEmbeddedSpeech::Servi
 
 }  // namespace
 
+#ifndef AZURE_EMBEDDED_TTS_GRPC_NO_MAIN
 int main(int argc, char** argv) {
   const auto address = env_or("AZURE_EMBEDDED_TTS_GRPC_URL", env_or("AZURE_EMBEDDED_GRPC_URL", "127.0.0.1:8793"));
   AzureEmbeddedTtsService service;
@@ -257,3 +275,4 @@ int main(int argc, char** argv) {
   server->Wait();
   return 0;
 }
+#endif

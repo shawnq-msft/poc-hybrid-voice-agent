@@ -117,7 +117,7 @@ class AzureEmbeddedASR:
         if not final_text:
             raise RuntimeError(
                 "AzureEmbeddedSpeech sidecar returned empty text. "
-                "Confirm the C++ gRPC sidecar is running and linked against Azure Speech SDK 1.47."
+                "Confirm the C++ gRPC sidecar is running and linked against Azure Speech SDK 1.50."
             )
         return ASRTranscript(final_text, locale, "azure-embedded")
 

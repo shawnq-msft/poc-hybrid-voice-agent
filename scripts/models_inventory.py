@@ -16,8 +16,8 @@ class ModelPath:
 def expected_paths(root: Path) -> list[ModelPath]:
     azure_root = root / "azure-embedded"
     return [
-        ModelPath("asr", "zh-CN 35M encrypted", azure_root / "asr" / "zh-CN" / "encrypted" / "35M"),
-        ModelPath("asr", "en-GB 35M encrypted", azure_root / "asr" / "en-GB" / "encrypted" / "v6" / "35M"),
+        ModelPath("asr", "zh-CN 35M decrypted", azure_root / "asr" / "zh-CN" / "decrypted" / "35M"),
+        ModelPath("asr", "en-GB 35M decrypted", azure_root / "asr" / "en-GB" / "decrypted" / "v6" / "35M"),
         ModelPath("tts", "zh-CN XiaoxiaoNeuralV6", azure_root / "tts" / "zh-CN" / "XiaoxiaoNeuralV6"),
         ModelPath("tts", "en-US AvaNeuralHDv2", azure_root / "tts" / "en-US" / "AvaNeuralHDv2"),
     ]
@@ -39,10 +39,15 @@ def format_size(size: int) -> str:
     return f"{size} B"
 
 
-def find_decrypted_dirs(root: Path) -> list[Path]:
+def find_obsolete_asset_dirs(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    return sorted(path for path in root.rglob("decrypted") if path.is_dir())
+    candidates = [
+        root / "asr" / "zh-CN" / "encrypted",
+        root / "asr" / "en-GB" / "encrypted",
+        root / "tts" / "zh-CN" / "XiaoxiaoNeuralHD",
+    ]
+    return sorted(path for path in candidates if path.is_dir())
 
 
 def remove_tree(path: Path) -> None:
@@ -57,7 +62,7 @@ def remove_tree(path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Report Azure Embedded model library layout without copying model assets.")
     parser.add_argument("--root", type=Path, default=Path("models"), help="Local ignored model root. Defaults to ./models.")
-    parser.add_argument("--delete-decrypted", action="store_true", help="Delete decrypted model directories after reporting them.")
+    parser.add_argument("--delete-obsolete-assets", action="store_true", help="Delete old SDK/model asset directories after reporting them.")
     args = parser.parse_args()
 
     root = args.root
@@ -71,19 +76,19 @@ def main() -> None:
         status = "present" if exists else "missing"
         print(f"- {model_path.kind}: {model_path.name}: {status} ({size}) -> {model_path.path}")
 
-    decrypted_dirs = find_decrypted_dirs(root / "azure-embedded")
-    if decrypted_dirs:
-        print("Decrypted directories:")
-        for path in decrypted_dirs:
+    obsolete_dirs = find_obsolete_asset_dirs(root / "azure-embedded")
+    if obsolete_dirs:
+        print("Obsolete asset directories:")
+        for path in obsolete_dirs:
             print(f"- {path} ({format_size(directory_size(path))})")
-        if args.delete_decrypted:
-            for path in decrypted_dirs:
+        if args.delete_obsolete_assets:
+            for path in obsolete_dirs:
                 remove_tree(path)
                 print(f"deleted: {path}")
         else:
-            print("Run again with --delete-decrypted to remove these directories.")
+            print("Run again with --delete-obsolete-assets to remove these directories.")
     else:
-        print("Decrypted directories: none")
+        print("Obsolete asset directories: none")
 
     if missing_required:
         raise SystemExit(2)

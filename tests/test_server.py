@@ -76,12 +76,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(updated.audio.faster_whisper_model, "base")
         self.assertEqual(updated.audio.asr_language, "en")
 
+    def test_request_options_apply_azure_embedded_tts_voice(self):
+        settings = Settings.from_env({}, base_dir=Path.cwd())
+
+        updated = _settings_with_request_options(
+            settings,
+            {"ttsProvider": "azure-embedded", "ttsVoice": "azure-embedded-en-US-AvaNeuralHD"},
+        )
+
+        self.assertEqual(updated.providers.tts, "azure-embedded")
+        self.assertEqual(updated.audio.azure_embedded_tts_voice, "azure-embedded-en-US-AvaNeuralHD")
+
     def test_request_options_apply_llm_model(self):
         settings = Settings.from_env({}, base_dir=Path.cwd())
 
         updated = _settings_with_request_options(settings, {"llmModel": "custom-local-llm"})
 
-        self.assertEqual(updated.llama_cpp.model, "custom-local-llm")
+        self.assertEqual(updated.foundry.llm_model, "custom-local-llm")
 
     def test_request_options_apply_foundry_llm_model(self):
         settings = Settings.from_env({}, base_dir=Path.cwd())
@@ -113,6 +124,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"prompt": "Custom prompt", "context": "Custom context"})
         self.assertEqual(client.get("/api/llm-config").json(), {"prompt": "Custom prompt", "context": "Custom context"})
+
+    def test_llm_config_endpoint_allows_empty_prompt(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        settings = Settings.from_env({}, base_dir=Path.cwd())
+        client = TestClient(create_app(settings))
+
+        response = client.post("/api/llm-config", json={"prompt": "", "context": "User: hi\nAgent: hello"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"prompt": "", "context": "User: hi\nAgent: hello"})
 
     def test_pipecat_app_uses_pure_pipecat_mode(self):
         try:

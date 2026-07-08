@@ -12,6 +12,7 @@ class PipelineEvent:
     module: str
     phase: str
     text: str | None = None
+    voice: str | None = None
     latency_ms: float | None = None
     total_ms: float | None = None
     audio_base64: str | None = None
@@ -21,6 +22,8 @@ class PipelineEvent:
         payload: dict[str, object] = {"stage": self.module, "status": self.phase}
         if self.text is not None:
             payload["text"] = self.text
+        if self.voice is not None:
+            payload["voice"] = self.voice
         if self.latency_ms is not None:
             payload["latencyMs"] = self.latency_ms
         if self.total_ms is not None:
@@ -42,6 +45,7 @@ def progress_event(
     phase: str,
     *,
     text: str | None = None,
+    voice: str | None = None,
     latency_ms: float | None = None,
     total_ms: float | None = None,
     audio_base64: str | None = None,
@@ -51,6 +55,7 @@ def progress_event(
         module=module,
         phase=phase,
         text=text,
+        voice=voice,
         latency_ms=latency_ms,
         total_ms=total_ms,
         audio_base64=audio_base64,

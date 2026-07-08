@@ -76,8 +76,8 @@ class LlamaCppLLM:
                 response.raise_for_status()
                 payload = response.json() if response.content else {}
         except Exception as exc:
-            return {"ready": False, "endpoint": self.settings.endpoint, "error": str(exc)}
-        return {"ready": True, "endpoint": self.settings.endpoint, "model": self.settings.model, "slotId": self.settings.slot_id, "details": payload}
+            return {"ready": False, "endpoint": self.settings.endpoint, "model": self.settings.model, "modelPath": str(self.settings.model_path), "error": str(exc)}
+        return {"ready": True, "endpoint": self.settings.endpoint, "model": self.settings.model, "modelPath": str(self.settings.model_path), "slotId": self.settings.slot_id, "details": payload}
 
     async def _completion(self, prompt: str, *, stream: bool, max_tokens: int | None = None) -> dict[str, object]:
         try:

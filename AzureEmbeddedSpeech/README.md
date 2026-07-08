@@ -8,7 +8,7 @@ Run from the repository root:
 
 ```powershell
 $env:PASCO_MODEL_KEY = (Get-Content .env | Select-String '^PASCO_MODEL_KEY=').ToString().Split('=',2)[1].Trim('"')
-$env:VOICE_AGENT_MODEL_ROOT = 'models/azure-embedded-asr'
+$env:VOICE_AGENT_AZURE_EMBEDDED_MODEL_ROOT = 'models/azure-embedded'
 dotnet run --project AzureEmbeddedSpeech/AzureEmbeddedSpeech.csproj
 ```
 

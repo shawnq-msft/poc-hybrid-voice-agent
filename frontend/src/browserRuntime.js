@@ -12,7 +12,8 @@ const state = {
   connected: false,
   config: null,
   modelsLoaded: false,
-  loadedModelSignature: null,
+  asrLlmLoadedSignature: null,
+  ttsLoadedSignature: null,
   llmConfigSyncTimer: null,
   sending: false,
   azureAsr: null,
@@ -21,6 +22,14 @@ const state = {
   responseSocket: null,
   responseTurnId: 0,
   interruptedTurnId: 0,
+  conversationTurns: [],
+  responsePlayback: {
+    turnId: 0,
+    userText: "",
+    playedSegments: [],
+    resultReceived: false,
+    conversationRecorded: false,
+  },
   currentTurn: {
     vadE2E: null,
     asrE2E: null,
@@ -58,6 +67,8 @@ const VAD = {
   minBlobBytes: 1400,
 };
 
+const AUTO_CONTEXT_MAX_BYTES = 1024;
+
 const connectionStatus = document.querySelector("#connectionStatus");
 const providerStatus = document.querySelector("#providerStatus");
 const loadModelsButton = document.querySelector("#loadModelsButton");
@@ -65,6 +76,7 @@ const connectButton = document.querySelector("#connectButton");
 const backendCheckButton = document.querySelector("#backendCheckButton");
 const muteButton = document.querySelector("#muteButton");
 const disconnectButton = document.querySelector("#disconnectButton");
+const resetContextButton = document.querySelector("#resetContextButton");
 const eventLog = document.querySelector("#eventLog");
 const userTranscript = document.querySelector("#userTranscript");
 const assistantTranscript = document.querySelector("#assistantTranscript");
@@ -129,10 +141,40 @@ function syncSelectors(config) {
   updateVadSelection(false);
   setSelectByValue(asrSelector, "azure-embedded:zh-CN");
   updateAsrMetricLabel();
-  setSelectByValue(llmSelector, "llama-cpp:gemma-4-e2b");
-  setSelectByValue(ttsSelector, ["azure-embedded", "edge-tts", "windows-sapi"].includes(config.providers.tts) ? config.providers.tts : "azure-embedded");
+  const configuredLlm = `${config.providers.llm}:${config.providers.llm === "llama-cpp" ? config.llamaCpp.model : config.foundry.llmModel}`;
+  setSelectByValue(llmSelector, configuredLlm);
+  const configuredTts = config.providers.tts === "azure-embedded"
+    ? `azure-embedded:${config.audio?.azureEmbeddedTts?.voice || "azure-embedded-zh-CN-XiaoxiaoNeuralV6"}`
+    : config.providers.tts;
+  setSelectByValue(ttsSelector, configuredTts);
   if (llmPromptInput) llmPromptInput.value = config.llmDefaults?.prompt || "";
-  if (llmContextInput) llmContextInput.value = config.llmDefaults?.context || "";
+  updateAutoContextInput();
+}
+
+function setLlmOptionAvailability(ready = null) {
+  const availableFoundryModels = new Set(ready?.foundry?.availableLlmModels || ready?.foundry?.models || []);
+  const llamaReady = Boolean(ready?.llamaCpp?.ready);
+  for (const option of llmSelector.options) {
+    const [provider, ...modelParts] = option.value.split(":");
+    const model = modelParts.join(":");
+    if (provider === "foundry-local" && availableFoundryModels.size > 0 && !availableFoundryModels.has(model)) {
+      option.disabled = true;
+      option.dataset.unavailable = "Foundry Local has not loaded this model.";
+    } else if (provider === "llama-cpp" && !llamaReady) {
+      option.disabled = true;
+      option.dataset.unavailable = ready?.llamaCpp?.error || "llama.cpp server is not running.";
+    } else {
+      option.disabled = false;
+      delete option.dataset.unavailable;
+    }
+  }
+  if (llmSelector.selectedOptions[0]?.disabled) {
+    const replacement = Array.from(llmSelector.options).find((option) => !option.disabled);
+    if (replacement) {
+      llmSelector.value = replacement.value;
+      markModelsDirty("Selected LLM is unavailable. Switched to an available model; load models again before Start.");
+    }
+  }
 }
 
 function setSelectByText(select, text) {
@@ -157,8 +199,12 @@ function updateVadSelection(announce = true) {
   }
 }
 
-function selectedTtsProvider() {
-  return ttsSelector.value;
+function selectedTtsOptions() {
+  const [ttsProvider, ...voiceParts] = ttsSelector.value.split(":");
+  return {
+    ttsProvider,
+    ttsVoice: voiceParts.join(":") || null,
+  };
 }
 
 function selectedLlmOptions() {
@@ -167,25 +213,167 @@ function selectedLlmOptions() {
     llmProvider,
     llmModel: modelParts.join(":"),
     llmPrompt: llmPromptInput?.value || "",
-    llmContext: llmContextInput?.value || "",
+    llmContext: currentAutoContext(),
   };
 }
 
 function selectedRuntimeOptions() {
-  return { ttsProvider: selectedTtsProvider(), ...selectedAsrOptions(), ...selectedLlmOptions() };
+  return { ...selectedTtsOptions(), ...selectedAsrOptions(), ...selectedLlmOptions() };
 }
 
 function selectedLlmConfigPayload() {
-  return { prompt: llmPromptInput?.value || "", context: llmContextInput?.value || "" };
+  return { prompt: llmPromptInput?.value || "", context: currentAutoContext() };
 }
 
-function selectedModelOptions() {
+function appendConversationTurn(userText, assistantText) {
+  const normalizedUserText = String(userText || "").trim();
+  const normalizedAssistantText = String(assistantText || "").trim();
+  if (!normalizedUserText && !normalizedAssistantText) {
+    return;
+  }
+  state.conversationTurns.push({ userText: normalizedUserText, assistantText: normalizedAssistantText });
+  updateAutoContextInput();
+}
+
+function beginResponsePlayback(userText, turnId = state.responseTurnId) {
+  const normalizedUserText = String(userText || "").trim();
+  if (!normalizedUserText) {
+    return;
+  }
+  state.responsePlayback = {
+    turnId,
+    userText: normalizedUserText,
+    playedSegments: [],
+    resultReceived: false,
+    conversationRecorded: false,
+  };
+}
+
+function updateResponsePlaybackUser(userText) {
+  const normalizedUserText = String(userText || "").trim();
+  if (!normalizedUserText) {
+    return;
+  }
+  if (!state.responsePlayback.userText) {
+    beginResponsePlayback(normalizedUserText);
+    return;
+  }
+  state.responsePlayback.userText = normalizedUserText;
+}
+
+function recordPlayedAssistantSegment(text) {
+  const normalizedText = String(text || "").trim();
+  if (normalizedText && !state.responsePlayback.conversationRecorded) {
+    state.responsePlayback.playedSegments.push(normalizedText);
+  }
+}
+
+function finalizeResponsePlayback({ interrupted = false } = {}) {
+  const playback = state.responsePlayback;
+  if (playback.conversationRecorded || !playback.userText) {
+    return;
+  }
+  const assistantText = playback.playedSegments.join(" ").trim();
+  appendConversationTurn(playback.userText, interrupted && assistantText ? ensureTrailingEllipsis(assistantText) : assistantText);
+  playback.conversationRecorded = true;
+}
+
+function maybeFinalizeCompletedPlayback() {
+  if (!state.responsePlayback.resultReceived || state.playingAudio || state.audioQueue.length > 0) {
+    return;
+  }
+  finalizeResponsePlayback();
+}
+
+function ensureTrailingEllipsis(text) {
+  const normalizedText = String(text || "").trim();
+  if (!normalizedText || normalizedText.endsWith("...") || normalizedText.endsWith("…")) {
+    return normalizedText;
+  }
+  return `${normalizedText}...`;
+}
+
+function currentAutoContext() {
+  const historyLines = [];
+  for (const turn of state.conversationTurns) {
+    if (turn.userText) historyLines.push(`User: ${turn.userText}`);
+    if (turn.assistantText) historyLines.push(`Agent: ${turn.assistantText}`);
+  }
+  const lines = [];
+  let totalBytes = 0;
+  for (let index = historyLines.length - 1; index >= 0; index -= 1) {
+    const line = historyLines[index];
+    const separatorBytes = lines.length > 0 ? 1 : 0;
+    const lineBytes = utf8ByteLength(line);
+    const candidateBytes = totalBytes + separatorBytes + lineBytes;
+    if (candidateBytes <= AUTO_CONTEXT_MAX_BYTES) {
+      lines.unshift(line);
+      totalBytes = candidateBytes;
+      continue;
+    }
+    const availableBytes = AUTO_CONTEXT_MAX_BYTES - totalBytes - separatorBytes;
+    if (availableBytes > 0) {
+      lines.unshift(trimSpeakerLineToLastBytes(line, availableBytes));
+    }
+    break;
+  }
+  return lines.join("\n");
+}
+
+function trimSpeakerLineToLastBytes(line, maxBytes) {
+  if (utf8ByteLength(line) <= maxBytes) {
+    return line;
+  }
+  const separatorIndex = line.indexOf(": ");
+  if (separatorIndex > 0) {
+    const prefix = line.slice(0, separatorIndex + 2);
+    const prefixBytes = utf8ByteLength(prefix);
+    if (prefixBytes < maxBytes) {
+      return `${prefix}${trimToLastUtf8Bytes(line.slice(separatorIndex + 2), maxBytes - prefixBytes)}`;
+    }
+  }
+  return trimToLastUtf8Bytes(line, maxBytes);
+}
+
+function trimToLastUtf8Bytes(value, maxBytes) {
+  const characters = Array.from(value);
+  let low = 0;
+  let high = characters.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = characters.slice(mid).join("");
+    if (utf8ByteLength(candidate) <= maxBytes) {
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return characters.slice(low).join("");
+}
+
+function updateAutoContextInput() {
+  const context = currentAutoContext();
+  if (llmContextInput) {
+    llmContextInput.value = context;
+  }
+  return context;
+}
+
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+function selectedAsrLlmModelOptions() {
   const { llmProvider, llmModel } = selectedLlmOptions();
-  return { ttsProvider: selectedTtsProvider(), ...selectedAsrOptions(), llmProvider, llmModel };
+  return { ...selectedAsrOptions(), llmProvider, llmModel };
 }
 
-function currentModelSignature() {
-  return JSON.stringify(selectedModelOptions());
+function currentAsrLlmModelSignature() {
+  return JSON.stringify(selectedAsrLlmModelOptions());
+}
+
+function currentTtsModelSignature() {
+  return JSON.stringify(selectedTtsOptions());
 }
 
 function markModelsDirty(reason = "Configuration changed. Load Models again before Start.") {
@@ -193,11 +381,41 @@ function markModelsDirty(reason = "Configuration changed. Load Models again befo
     return;
   }
   state.modelsLoaded = false;
-  state.loadedModelSignature = null;
+  state.asrLlmLoadedSignature = null;
+  state.ttsLoadedSignature = null;
   connectButton.disabled = true;
   setStatus("Models need reload", true);
   setModuleStatus({ asr: "Stale", llm: "Stale", tts: "Stale" });
   logEvent(reason);
+}
+
+function closePreparedTextTurn() {
+  if (!state.preparedTextTurn?.active) {
+    return;
+  }
+  try {
+    state.preparedTextTurn.socket.close();
+  } catch {
+    // Ignore close races; the next prepared turn owns the latest settings.
+  }
+  state.preparedTextTurn = null;
+}
+
+function markTtsChanged() {
+  closePreparedTextTurn();
+  state.modelsLoaded = false;
+  state.ttsLoadedSignature = null;
+  connectButton.disabled = true;
+  setStatus("TTS needs reload", true);
+  setModuleStatus({ tts: "Stale" });
+  logEvent("TTS model changed. Click Load Models to preload and warm up the selected TTS voice. ASR and LLM selection are unchanged.");
+}
+
+function resetContext() {
+  state.conversationTurns = [];
+  updateAutoContextInput();
+  scheduleLlmConfigSync();
+  logEvent("Conversation context reset.");
 }
 
 function selectedAsrOptions() {
@@ -234,6 +452,9 @@ async function loadConfig() {
     state.config = config;
     providerStatus.textContent = `${config.providers.asr} ASR / ${config.providers.tts} TTS / ${config.providers.llm} LLM`;
     syncSelectors(config);
+    const readyResponse = await fetch("/api/ready");
+    const ready = await readyResponse.json();
+    setLlmOptionAvailability(ready);
     logEvent("Loaded provider configuration.");
   } catch (error) {
     providerStatus.textContent = "Provider config unavailable";
@@ -263,17 +484,20 @@ async function syncLlmConfig() {
   }
   const payload = await response.json();
   if (llmPromptInput && document.activeElement !== llmPromptInput) llmPromptInput.value = payload.prompt || "";
-  if (llmContextInput && document.activeElement !== llmContextInput) llmContextInput.value = payload.context || "";
+  updateAutoContextInput();
 }
 
 async function loadModels() {
-  const signature = currentModelSignature();
+  closePreparedTextTurn();
+  const asrLlmSignature = currentAsrLlmModelSignature();
+  const ttsSignature = currentTtsModelSignature();
   setStatus("Loading models");
   setModuleStatus({ asr: "Loading", llm: "Loading", tts: "Loading" });
   loadModelsButton.disabled = true;
   const payload = await readModelLoadEvents(selectedRuntimeOptions());
   state.modelsLoaded = true;
-  state.loadedModelSignature = signature;
+  state.asrLlmLoadedSignature = asrLlmSignature;
+  state.ttsLoadedSignature = ttsSignature;
   connectButton.disabled = false;
   loadModelsButton.disabled = false;
   setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
@@ -334,11 +558,18 @@ async function start() {
   if (!state.modelsLoaded) {
     throw new Error("Load models before starting the microphone.");
   }
-  if (state.loadedModelSignature !== currentModelSignature()) {
+  if (state.asrLlmLoadedSignature !== currentAsrLlmModelSignature()) {
     state.modelsLoaded = false;
-    state.loadedModelSignature = null;
+    state.asrLlmLoadedSignature = null;
+    state.ttsLoadedSignature = null;
     connectButton.disabled = true;
-    throw new Error("Configuration changed. Load models again before starting the microphone.");
+    throw new Error("ASR or LLM configuration changed. Load models again before starting the microphone.");
+  }
+  if (state.ttsLoadedSignature !== currentTtsModelSignature()) {
+    state.modelsLoaded = false;
+    state.ttsLoadedSignature = null;
+    connectButton.disabled = true;
+    throw new Error("TTS configuration changed. Load models again to preload and warm up the selected voice.");
   }
   setStatus("Requesting microphone");
   setModuleStatus({ mic: "Opening" });
@@ -550,6 +781,7 @@ async function sendAzureEmbeddedTurn() {
       throw new Error("Azure Embedded ASR returned empty text.");
     }
     userTranscript.textContent = userText;
+    beginResponsePlayback(userText, turnId);
     const result = await postTextTurnWebSocket(userText, turnId, { vadLatencyMs, asrLatencyMs });
     if (turnId <= state.interruptedTurnId || !result) {
       return;
@@ -586,6 +818,7 @@ async function postTurn(blob) {
   formData.append("audio", blob, `recording.${extension}`);
   const runtimeOptions = selectedRuntimeOptions();
   formData.append("tts_provider", runtimeOptions.ttsProvider);
+  if (runtimeOptions.ttsVoice) formData.append("tts_voice", runtimeOptions.ttsVoice);
   formData.append("llm_model", runtimeOptions.llmModel);
   formData.append("llm_prompt", runtimeOptions.llmPrompt);
   formData.append("llm_context", runtimeOptions.llmContext);
@@ -695,6 +928,9 @@ function handleTurnStreamMessage(stream, message) {
   if (typeof message.data === "string") {
     const event = JSON.parse(message.data);
     if (event.event === "progress") {
+      if (event.stage === "asr" && event.status === "idle" && event.text) {
+        updateResponsePlaybackUser(event.text);
+      }
       if (event.stage === "tts" && event.status === "audio") {
         stream.pendingAudio = event;
       }
@@ -736,7 +972,7 @@ function postTurnWebSocket(blob) {
       const extension = blob.type.includes("mp4") ? "m4a" : "webm";
       socket.send(JSON.stringify({
         type: "config",
-        ttsProvider: selectedTtsProvider(),
+        ...selectedTtsOptions(),
         ...selectedAsrOptions(),
         filename: `recording.${extension}`,
         mediaType: blob.type || "audio/webm",
@@ -749,6 +985,9 @@ function postTurnWebSocket(blob) {
       if (typeof message.data === "string") {
         const event = JSON.parse(message.data);
         if (event.event === "progress") {
+          if (event.stage === "asr" && event.status === "idle" && event.text) {
+            updateResponsePlaybackUser(event.text);
+          }
           if (event.stage === "tts" && event.status === "audio") {
             pendingAudio = event;
           }
@@ -839,6 +1078,7 @@ function postTextTurnWebSocket(text, turnId = state.responseTurnId, timings = {}
     const socket = preparedTurn?.socket || new WebSocket(`${protocol}//${location.host}/api/session/text-turn-ws`);
     if (preparedTurn && state.preparedTextTurn === preparedTurn) state.preparedTextTurn = null;
     state.responseSocket = socket;
+    beginResponsePlayback(text, turnId);
     socket.binaryType = "arraybuffer";
     let result = null;
     let pendingAudio = null;
@@ -919,6 +1159,7 @@ function interruptAssistantResponse() {
   if (!hasResponseSocket && !activeTurnStream && !activePreparedTextTurn && !state.playingAudio && state.audioQueue.length === 0) {
     return;
   }
+  finalizeResponsePlayback({ interrupted: true });
   state.interruptedTurnId = state.responseTurnId;
   if (activeTurnStream) {
     try {
@@ -951,6 +1192,9 @@ function interruptAssistantResponse() {
   remoteAudio.pause();
   remoteAudio.removeAttribute("src");
   remoteAudio.load();
+  if ("speechSynthesis" in window) {
+    speechSynthesis.cancel();
+  }
   if (activeAudioUrl.startsWith("blob:")) URL.revokeObjectURL(activeAudioUrl);
   setModuleStatus({ llm: "Interrupted", tts: "Interrupted" });
   logEvent("Assistant response interrupted by speech.");
@@ -1168,7 +1412,10 @@ function applyProgressEvent(event) {
       } else if (Number.isFinite(event.latencyMs)) {
         updateSingleMetric("asr", event.latencyMs, false);
       }
-      if (event.text) userTranscript.textContent = event.text;
+      if (event.text) {
+        userTranscript.textContent = event.text;
+        updateResponsePlaybackUser(event.text);
+      }
     }
   }
   if (event.stage === "llm") {
@@ -1204,8 +1451,9 @@ function enqueueAudioChunk(event) {
   }
   recordFirstPlayableAudio(event);
   state.currentTurn.streamedAudioChunks += 1;
-  state.audioQueue.push(`data:${event.audioMediaType};base64,${event.audioBase64}`);
-  logEvent(`TTS audio chunk ${state.currentTurn.streamedAudioChunks} queued.`);
+  state.audioQueue.push({ src: `data:${event.audioMediaType};base64,${event.audioBase64}`, text: event.text || "" });
+  const voice = event.voice ? ` using ${event.voice}` : "";
+  logEvent(`TTS audio chunk ${state.currentTurn.streamedAudioChunks} queued${voice}.`);
   playNextAudioChunk();
 }
 
@@ -1213,7 +1461,7 @@ function enqueueAudioBlob(event, arrayBuffer) {
   recordFirstPlayableAudio(event);
   state.currentTurn.streamedAudioChunks += 1;
   const blob = new Blob([arrayBuffer], { type: event.audioMediaType || "audio/wav" });
-  state.audioQueue.push(URL.createObjectURL(blob));
+  state.audioQueue.push({ src: URL.createObjectURL(blob), text: event.text || "" });
   logEvent(`TTS binary audio chunk ${state.currentTurn.streamedAudioChunks} queued.`);
   playNextAudioChunk();
 }
@@ -1264,12 +1512,15 @@ function runTypewriter() {
 
 function playNextAudioChunk() {
   if (state.playingAudio || state.audioQueue.length === 0) {
+    maybeFinalizeCompletedPlayback();
     return;
   }
   state.playingAudio = true;
-  remoteAudio.src = state.audioQueue.shift();
+  const item = state.audioQueue.shift();
+  remoteAudio.src = item.src;
   remoteAudio.onended = () => {
     if (remoteAudio.src.startsWith("blob:")) URL.revokeObjectURL(remoteAudio.src);
+    recordPlayedAssistantSegment(item.text);
     state.playingAudio = false;
     playNextAudioChunk();
   };
@@ -1350,7 +1601,6 @@ function resetVad() {
   state.currentTurn.streamingAsr = false;
   state.typewriterQueue = [];
   state.typewriterActive = false;
-  state.audioQueue = [];
 }
 
 function renderRealTurn(result) {
@@ -1358,19 +1608,51 @@ function renderRealTurn(result) {
   if (!state.currentTurn.streamedAssistantText) {
     assistantTranscript.textContent = result.assistantText;
   }
-  logEvent(`real-audio-turn passed with ${result.vad?.provider || "unknown"} VAD, ${result.asr.provider} ASR and ${result.tts.provider} TTS.`);
+  updateResponsePlaybackUser(result.userText);
+  state.responsePlayback.resultReceived = true;
+  const ttsVoice = result.tts.voice ? ` (${result.tts.voice})` : "";
+  logEvent(`real-audio-turn passed with ${result.vad?.provider || "unknown"} VAD, ${result.asr.provider} ASR and ${result.tts.provider}${ttsVoice} TTS.`);
   if (state.currentTurn.streamedAudioChunks > 0) {
+    maybeFinalizeCompletedPlayback();
     return;
   }
   if (result.tts.audioBase64) {
     recordFirstPlayableAudio({ latencyMs: result.timingsMs?.tts });
     const audioUrl = `data:${result.tts.audioMediaType};base64,${result.tts.audioBase64}`;
+    state.playingAudio = true;
     remoteAudio.src = audioUrl;
-    remoteAudio.play().catch((error) => logEvent(`Audio playback blocked: ${error.message}`));
+    remoteAudio.onended = () => {
+      recordPlayedAssistantSegment(result.assistantText);
+      state.playingAudio = false;
+      maybeFinalizeCompletedPlayback();
+    };
+    remoteAudio.onerror = () => {
+      state.playingAudio = false;
+      maybeFinalizeCompletedPlayback();
+    };
+    remoteAudio.play().catch((error) => {
+      state.playingAudio = false;
+      logEvent(`Audio playback blocked: ${error.message}`);
+      maybeFinalizeCompletedPlayback();
+    });
   } else if (result.tts.browserFallback && "speechSynthesis" in window) {
     speechSynthesis.cancel();
-    speechSynthesis.speak(new SpeechSynthesisUtterance(result.assistantText));
+    const utterance = new SpeechSynthesisUtterance(result.assistantText);
+    utterance.onend = () => {
+      recordPlayedAssistantSegment(result.assistantText);
+      state.playingAudio = false;
+      maybeFinalizeCompletedPlayback();
+    };
+    utterance.onerror = () => {
+      state.playingAudio = false;
+      maybeFinalizeCompletedPlayback();
+    };
+    state.playingAudio = true;
+    speechSynthesis.speak(utterance);
     logEvent("Using browser speechSynthesis fallback for TTS playback.");
+  } else {
+    recordPlayedAssistantSegment(result.assistantText);
+    maybeFinalizeCompletedPlayback();
   }
 }
 
@@ -1506,10 +1788,16 @@ function disconnect() {
 
 loadModelsButton.addEventListener("click", async () => {
   try {
+    setLlmOptionAvailability(await (await fetch("/api/ready")).json());
+    const unavailableReason = llmSelector.selectedOptions[0]?.dataset.unavailable;
+    if (unavailableReason) {
+      throw new Error(`Selected LLM is unavailable: ${unavailableReason}`);
+    }
     await loadModels();
   } catch (error) {
     state.modelsLoaded = false;
-    state.loadedModelSignature = null;
+    state.asrLlmLoadedSignature = null;
+    state.ttsLoadedSignature = null;
     connectButton.disabled = true;
     setStatus("Model load failed", true);
     setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
@@ -1552,6 +1840,11 @@ muteButton.addEventListener("click", () => {
 });
 
 disconnectButton.addEventListener("click", disconnect);
+resetContextButton?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  resetContext();
+});
 vadSelector.addEventListener("change", () => {
   updateVadSelection();
   markModelsDirty("VAD selection changed. Load Models again before Start.");
@@ -1561,7 +1854,7 @@ asrSelector.addEventListener("change", () => {
   markModelsDirty("ASR selection changed. Load Models again before Start.");
 });
 llmSelector.addEventListener("change", () => markModelsDirty("LLM model changed. Load Models again before Start."));
-ttsSelector.addEventListener("change", () => markModelsDirty("TTS model changed. Load Models again before Start."));
+ttsSelector.addEventListener("change", markTtsChanged);
 llmPromptInput?.addEventListener("input", scheduleLlmConfigSync);
 llmContextInput?.addEventListener("input", scheduleLlmConfigSync);
 

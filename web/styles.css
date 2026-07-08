@@ -237,9 +237,30 @@ h2 {
 }
 
 .llm-config summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   cursor: pointer;
   color: var(--accent-strong);
   font-weight: 800;
+}
+
+.llm-config summary::marker {
+  color: var(--muted);
+}
+
+#resetContextButton {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 0.74rem;
+  border-color: rgba(15, 118, 110, 0.38);
+  background: rgba(15, 118, 110, 0.08);
+  color: var(--accent-strong);
+}
+
+#resetContextButton:hover:not(:disabled) {
+  background: rgba(15, 118, 110, 0.14);
 }
 
 .llm-config-grid {

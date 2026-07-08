@@ -1,3 +1,0 @@
-[console_scripts]
-voice-agent = voice_agent.server:main
-voice-agent-health = voice_agent.health:main

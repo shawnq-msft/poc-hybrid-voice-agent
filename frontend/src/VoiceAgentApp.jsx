@@ -19,11 +19,11 @@ export function VoiceAgentApp() {
           <button id="muteButton" type="button" disabled>Mute</button>
           <button id="disconnectButton" type="button" disabled>Stop</button>
         </div>
-        <details className="llm-config" id="llmConfigPanel" open>
-          <summary>LLM Prompt &amp; Context</summary>
+        <details className="llm-config" id="llmConfigPanel">
+          <summary><span>LLM Prompt &amp; Context</span><button id="resetContextButton" type="button">Reset Context</button></summary>
           <div className="llm-config-grid">
-            <label>Prompt<textarea id="llmPromptInput" rows="4" defaultValue="You are a helpful voice assistant." /></label>
-            <label>Context<textarea id="llmContextInput" rows="4" placeholder="Optional runtime context" /></label>
+            <label>Prompt<textarea id="llmPromptInput" rows="4" /></label>
+            <label>Context<textarea id="llmContextInput" rows="4" readOnly placeholder="Recent conversation is assembled automatically" /></label>
           </div>
         </details>
         <div className="module-strip" aria-label="Speech pipeline modules">
@@ -53,7 +53,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="LLM module">
             <div className="module-heading"><span>LLM</span><strong id="llmStatus">Idle</strong></div>
-            <label>Model/API<select id="llmSelector" defaultValue="llama-cpp:gemma-4-e2b"><option value="llama-cpp:gemma-4-e2b">llama.cpp Gemma 4 E2B</option><option value="foundry-local:gemma-4-e2b">Foundry Gemma 4 E2B</option><option value="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option disabled>Cloud fallback</option></select></label>
+            <label>Model/API<select id="llmSelector" defaultValue="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4"><option value="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option value="foundry-local:gemma-4-e2b">Foundry Gemma 4 E2B (requires catalog model)</option><option value="llama-cpp:gemma-3n-e2b-it">llama.cpp Gemma 3n E2B IT Q4_K_M</option><option disabled>Cloud fallback</option></select></label>
             <dl className="latency-list">
               <div><dt>TTFT</dt><dd id="llmTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="llmAvg">-</dd></div>
@@ -62,7 +62,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="TTS module">
             <div className="module-heading"><span>TTS</span><strong id="ttsStatus">Idle</strong></div>
-            <label>Model/API<select id="ttsSelector" defaultValue="azure-embedded"><option value="azure-embedded">Azure Embedded Xiaoxiao V6</option><option value="edge-tts">Edge Xiaoxiao Neural</option><option value="windows-sapi">Windows SAPI</option><option value="browser-speech" disabled>Browser speechSynthesis</option><option value="azure-speech" disabled>Azure Speech</option></select></label>
+            <label>Model/API<select id="ttsSelector" defaultValue="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6"><option value="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6">Azure Embedded Xiaoxiao V6</option><option value="azure-embedded:azure-embedded-en-US-AvaNeuralHD">Azure Embedded Ava HD en-US</option><option value="edge-tts">Edge Xiaoxiao Neural</option><option value="windows-sapi">Windows SAPI</option><option value="browser-speech" disabled>Browser speechSynthesis</option><option value="azure-speech" disabled>Azure Speech</option></select></label>
             <dl className="latency-list">
               <div><dt>TTFB</dt><dd id="ttsTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="ttsAvg">-</dd></div>

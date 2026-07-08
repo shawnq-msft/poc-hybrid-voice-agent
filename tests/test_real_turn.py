@@ -8,7 +8,7 @@ import _path  # noqa: F401
 from voice_agent.config import Settings
 from voice_agent.providers.asr import ASRTranscript
 from voice_agent.providers.llm_foundry import ChatMessage
-from voice_agent.real_turn import AzureEmbeddedTTSClient, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
+from voice_agent.real_turn import AzureEmbeddedTTSClient, check_foundry_ready, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
 
 
 class FakeASR:
@@ -215,6 +215,23 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.messages[1].content, "Context:\n当前场景：本地语音助手。")
         self.assertEqual(llm.messages[2].content, "用户问题")
 
+    async def test_text_turn_allows_empty_prompt_with_context_only(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        llm = FakeLLM()
+
+        await run_text_turn(
+            settings,
+            "现在的问题",
+            llm_client=llm,
+            tts_client=FakeTTS(),
+            llm_prompt="",
+            llm_context="User: 你好\nAgent: 你好，有什么可以帮你？",
+        )
+
+        self.assertEqual([message.role for message in llm.messages], ["system", "user"])
+        self.assertEqual(llm.messages[0].content, "Context:\nUser: 你好\nAgent: 你好，有什么可以帮你？")
+        self.assertEqual(llm.messages[1].content, "现在的问题")
+
     async def test_text_turn_cancellation_stops_streaming_llm_and_tts(self):
         settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
         llm = SlowStreamingLLM()
@@ -251,9 +268,9 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("voice_agent.real_turn.warm_silero_vad"),
-            patch("voice_agent.real_turn.check_llama_cpp_ready", new=AsyncMock(return_value={"ready": True, "model": "gemma-4-e2b"})),
+            patch("voice_agent.real_turn.check_foundry_ready", new=AsyncMock(return_value={"ready": True, "models": ["qwen2.5-0.5b-instruct-cuda-gpu:4"]})),
             patch("voice_agent.real_turn.warm_foundry_streaming_asr", return_value={"provider": "foundry-local", "model": "asr"}),
-            patch("voice_agent.real_turn.LlamaCppLLM", FakeFoundryLLM),
+            patch("voice_agent.real_turn.FoundryLocalLLM", FakeFoundryLLM),
             patch("voice_agent.real_turn._check_azure_embedded_health", return_value={"provider": "azure-embedded", "model": "tts"}),
             patch("voice_agent.real_turn._synthesize_tts", new=AsyncMock(return_value=(b"RIFF....WAVE", "audio/wav"))),
         ):
@@ -266,6 +283,73 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("memoryRssMb", events[-1])
         self.assertEqual(summary["status"], "ready")
         self.assertIn("tts", summary["timingsMs"])
+
+    async def test_warm_real_chain_rejects_missing_foundry_llm_model_before_completion(self):
+        settings = Settings.from_env(
+            {"VOICE_AGENT_LLM_PROVIDER": "foundry-local", "VOICE_AGENT_FOUNDRY_LLM_MODEL": "gemma-4-e2b"},
+            base_dir=Path("C:/workspace"),
+        )
+
+        class FailingFoundryLLM:
+            def __init__(self, settings):
+                self.settings = settings
+
+            async def complete(self, messages):
+                raise AssertionError("Foundry completion should not be called for an unavailable model")
+
+        with (
+            patch("voice_agent.real_turn.warm_silero_vad"),
+            patch("voice_agent.real_turn.warm_foundry_streaming_asr", return_value={"provider": "foundry-local", "model": "asr"}),
+            patch(
+                "voice_agent.real_turn.check_foundry_ready",
+                new=AsyncMock(
+                    side_effect=[
+                        {
+                            "ready": False,
+                            "models": ["qwen2.5-0.5b-instruct-cuda-gpu:4"],
+                            "error": "Configured Foundry LLM model is not loaded: gemma-4-e2b",
+                        },
+                    ]
+                ),
+            ),
+            patch("voice_agent.real_turn.FoundryLocalLLM", FailingFoundryLLM),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "gemma-4-e2b"):
+                [event async for event in iter_warm_real_chain(settings)]
+
+    async def test_foundry_ready_reports_configured_model_availability(self):
+        settings = Settings.from_env(
+            {"VOICE_AGENT_FOUNDRY_ENDPOINT": "http://foundry.test/v1", "VOICE_AGENT_FOUNDRY_LLM_MODEL": "gemma-4-e2b"},
+            base_dir=Path("C:/workspace"),
+        )
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"data": [{"id": "qwen2.5-0.5b-instruct-cuda-gpu:4"}]}
+
+        class FakeAsyncClient:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+            async def get(self, url):
+                return FakeResponse()
+
+        with patch("httpx.AsyncClient", FakeAsyncClient):
+            status = await check_foundry_ready(settings)
+
+        self.assertFalse(status["ready"])
+        self.assertFalse(status["llmModelAvailable"])
+        self.assertEqual(status["availableLlmModels"], ["qwen2.5-0.5b-instruct-cuda-gpu:4"])
+        self.assertIn("gemma-4-e2b", status["error"])
 
 
 if __name__ == "__main__":
