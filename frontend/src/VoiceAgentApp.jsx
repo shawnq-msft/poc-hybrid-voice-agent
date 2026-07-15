@@ -44,7 +44,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="ASR module">
             <div className="module-heading"><span>ASR</span><strong id="asrStatus">Idle</strong></div>
-            <label>Model/API<select id="asrSelector" defaultValue="azure-embedded:zh-CN"><option value="azure-embedded:zh-CN">Azure Embedded ASR zh-CN 35M</option><option value="azure-embedded:en-GB">Azure Embedded ASR en-GB 35M</option><option value="foundry-local:nemotron-3.5-asr-streaming-0.6b:auto">Foundry Nemotron ASR multilingual 0.6B</option><option value="foundry-local:nemotron-speech-streaming-en-0.6b:en">Foundry Nemotron Speech English 0.6B</option><option value="faster-whisper:tiny:auto">faster-whisper tiny CPU fallback</option><option disabled>whisper.cpp</option><option disabled>Vosk</option></select></label>
+            <label>Model/API<select id="asrSelector" defaultValue="azure-embedded:zh-CN"><option value="azure-embedded:zh-CN">Azure Embedded ASR zh-CN 35M</option><option value="azure-embedded:en-GB">Azure Embedded ASR en-GB 35M</option><option value="lfm2-audio:LiquidAI/LFM2.5-Audio-1.5B:en">LiquidAI LFM2.5 Audio 1.5B</option><option value="foundry-local:nemotron-3.5-asr-streaming-0.6b:auto">Foundry Nemotron ASR multilingual 0.6B</option><option value="foundry-local:nemotron-speech-streaming-en-0.6b:en">Foundry Nemotron Speech English 0.6B</option><option value="faster-whisper:tiny:auto">faster-whisper tiny CPU fallback</option><option disabled>whisper.cpp</option><option disabled>Vosk</option></select></label>
             <dl className="latency-list">
               <div><dt id="asrMetricLabel">Final</dt><dd id="asrTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="asrAvg">-</dd></div>
@@ -53,7 +53,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="LLM module">
             <div className="module-heading"><span>LLM</span><strong id="llmStatus">Idle</strong></div>
-            <label>Model/API<select id="llmSelector" defaultValue="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4"><option value="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option value="foundry-local:gemma-4-e2b">Foundry Gemma 4 E2B (requires catalog model)</option><option value="llama-cpp:gemma-3n-e2b-it">llama.cpp Gemma 3n E2B IT Q4_K_M</option><option disabled>Cloud fallback</option></select></label>
+            <label>Model/API<select id="llmSelector" defaultValue="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4"><option value="foundry-local:qwen2.5-0.5b-instruct-cuda-gpu:4">Foundry qwen2.5 0.5B</option><option value="lfm2-audio:LiquidAI/LFM2.5-Audio-1.5B">LiquidAI LFM2.5 Audio 1.5B</option><option value="foundry-local:gemma-4-e2b">Foundry Gemma 4 E2B (requires catalog model)</option><option value="llama-cpp:gemma-3n-e2b-it">llama.cpp Gemma 3n E2B IT Q4_K_M</option><option disabled>Cloud fallback</option></select></label>
             <dl className="latency-list">
               <div><dt>TTFT</dt><dd id="llmTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="llmAvg">-</dd></div>
@@ -62,7 +62,7 @@ export function VoiceAgentApp() {
           </section>
           <section className="module-card" aria-label="TTS module">
             <div className="module-heading"><span>TTS</span><strong id="ttsStatus">Idle</strong></div>
-            <label>Model/API<select id="ttsSelector" defaultValue="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6"><option value="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6">Azure Embedded Xiaoxiao V6</option><option value="azure-embedded:azure-embedded-en-US-AvaNeuralHD">Azure Embedded Ava HD en-US</option><option value="edge-tts">Edge Xiaoxiao Neural</option><option value="windows-sapi">Windows SAPI</option><option value="browser-speech" disabled>Browser speechSynthesis</option><option value="azure-speech" disabled>Azure Speech</option></select></label>
+            <label>Model/API<select id="ttsSelector" defaultValue="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6"><option value="azure-embedded:azure-embedded-zh-CN-XiaoxiaoNeuralV6">Azure Embedded Xiaoxiao V6</option><option value="lfm2-audio:LiquidAI/LFM2.5-Audio-1.5B">LiquidAI LFM2.5 Audio 1.5B</option><option value="azure-embedded:azure-embedded-en-US-AvaNeuralHD">Azure Embedded Ava HD en-US</option><option value="edge-tts">Edge Xiaoxiao Neural</option><option value="windows-sapi">Windows SAPI</option><option value="browser-speech" disabled>Browser speechSynthesis</option><option value="azure-speech" disabled>Azure Speech</option></select></label>
             <dl className="latency-list">
               <div><dt>TTFB</dt><dd id="ttsTurn">-</dd></div>
               <div><dt>AVG</dt><dd id="ttsAvg">-</dd></div>

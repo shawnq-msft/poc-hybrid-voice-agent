@@ -23,7 +23,7 @@ The current implementation establishes the project structure, configuration mode
 - VAD: Silero VAD first, WebRTC VAD as an ultra-light fallback.
 - ASR: Foundry Local streaming speech models first. The current options are `nemotron-3.5-asr-streaming-0.6b` for multilingual/auto-detect and `nemotron-speech-streaming-en-0.6b` for English. `faster-whisper` remains available only as a separate local fallback implementation.
 - Azure Embedded Speech: local ASR/TTS model assets live under `models/azure-embedded`, which is ignored by Git. The model key belongs in `.env` as `PASCO_MODEL_KEY`; do not commit it.
-- LLM: Foundry Local. This machine currently has `qwen2.5-0.5b-instruct-cuda-gpu:4` available; use Gemma through Foundry only if it appears in your Foundry Local catalog. For local Gemma E2B, use the downloaded GGUF with llama.cpp.
+- LLM: Foundry Local. This machine currently has `qwen2.5-0.5b-instruct-cuda-gpu:4` available; use Gemma through Foundry only if it appears in your Foundry Local catalog. Gemma 4 E2B is also available through the local HF Transformers QAT runtime, but it is experimental and not real-time on CPU-only PyTorch.
 - TTS: Azure Embedded HD voices can run through the native gRPC sidecar; Edge neural TTS and Windows SAPI remain selectable fallbacks.
 
 ## Setup
@@ -63,6 +63,14 @@ VOICE_AGENT_FOUNDRY_LLM_MODEL=<exact-chat-model-id, for example qwen2.5-0.5b-ins
 VOICE_AGENT_FOUNDRY_ASR_MODEL=nemotron-3.5-asr-streaming-0.6b
 VOICE_AGENT_FOUNDRY_TIMEOUT_SECONDS=180
 ```
+
+## Gemma 4 E2B HF runtime
+
+Gemma 4 E2B is exposed as `google/gemma-4-E2B-it-qat-mobile-transformers` for both LLM and multimodal ASR. This is Google's QAT mobile 8-bit Transformers snapshot with the processor files required for audio input. The full `google/gemma-4-E2B-it` checkpoint is much larger and should not be downloaded unless you explicitly need the full-precision model.
+
+The HF runtime exposes explicit CPU thread controls. By default, `VOICE_AGENT_GEMMA_4_E2B_TORCH_THREADS` uses `os.cpu_count()` and `VOICE_AGENT_GEMMA_4_E2B_TORCH_INTEROP_THREADS` defaults to `2`; `/api/ready.gemma4E2B` reports the applied `torchThreads` and `torchInteropThreads`. If CPU utilization is still low, tune these values before starting the server instead of relying on PyTorch defaults.
+
+On this machine, `/api/ready.gemma4E2B` reports CPU-only PyTorch. Gemma ASR + Gemma LLM first attempts one fused audio generation; if the model returns only a transcript, the backend falls back to a second Gemma text completion and marks `timingsMs.gemmaFusedFallback`. This keeps the path functional but is not suitable for real-time voice turns here.
 
 ## llama.cpp Gemma E2B
 

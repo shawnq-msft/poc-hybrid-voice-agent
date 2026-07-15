@@ -31,6 +31,20 @@ local-audio = [
     "pyttsx3>=2.90",
     "foundry-local-sdk-winml>=0.1",
 ]
+gemma-hf = [
+    "transformers>=4.57",
+    "torch>=2.3",
+    "accelerate>=1.14",
+    "huggingface-hub>=0.30",
+    "soundfile>=0.12",
+    "av>=12",
+]
+lfm2-audio = [
+    "liquid-audio>=1.3",
+    "torch>=2.3",
+    "soundfile>=0.12",
+    "av>=12",
+]
 dev = [
     "pytest>=8.2",
     "grpcio-tools>=1.64",

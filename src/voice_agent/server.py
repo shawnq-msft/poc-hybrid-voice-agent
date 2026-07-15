@@ -14,10 +14,11 @@ except ImportError:  # pragma: no cover - create_app raises a clearer install er
     UploadFile = object  # type: ignore[assignment]
     WebSocket = object  # type: ignore[assignment]
 
-from voice_agent.config import Settings
+from voice_agent.config import GEMMA_4_E2B_ASR_PROVIDER, GEMMA_4_E2B_INSTRUCT_MODEL_ID, LFM2_AUDIO_MODEL_ID, LFM2_AUDIO_PROVIDER, Settings, is_gemma_4_e2b_model
 from voice_agent.providers.tts_windows import synthesize_sapi_wav
 from voice_agent.health import collect_health
 from voice_agent.real_turn import DEFAULT_SYSTEM_PROMPT, check_foundry_ready, check_llama_cpp_ready, iter_warm_real_chain, prepare_llm_turn, run_real_turn, run_text_turn, warm_real_chain
+from voice_agent.providers.gemma4_e2b import Gemma4E2BLLM, check_gemma_4_e2b_ready
 from voice_agent.providers.llm_foundry import FoundryLocalLLM
 from voice_agent.providers.llm_llama_cpp import LlamaCppLLM
 from voice_agent.smoke import run_smoke_turn
@@ -63,6 +64,13 @@ def create_app(
 
     @app.on_event("startup")
     async def warm_models_on_startup() -> None:
+        if (
+            resolved_settings.providers.asr == LFM2_AUDIO_PROVIDER
+            and resolved_settings.providers.llm == LFM2_AUDIO_PROVIDER
+            and resolved_settings.providers.tts == LFM2_AUDIO_PROVIDER
+        ):
+            return
+
         async def warm() -> None:
             try:
                 await warm_real_chain(resolved_settings)
@@ -97,10 +105,14 @@ def create_app(
 
     @app.get("/api/ready")
     async def ready() -> dict[str, object]:
-        return {"foundry": await check_foundry_ready(resolved_settings), "llamaCpp": await check_llama_cpp_ready(resolved_settings)}
+        return {
+            "foundry": await check_foundry_ready(resolved_settings),
+            "llamaCpp": await check_llama_cpp_ready(resolved_settings),
+            "gemma4E2B": await asyncio.to_thread(check_gemma_4_e2b_ready, resolved_settings.gemma_4_e2b),
+        }
 
     @app.post("/api/models/load")
-    async def load_models(payload: dict[str, str] | None = Body(default=None)) -> StreamingResponse:
+    async def load_models(payload: dict[str, object] | None = Body(default=None)) -> StreamingResponse:
         request_settings = _settings_with_request_options(resolved_settings, payload or {})
 
         async def event_stream():
@@ -113,6 +125,8 @@ def create_app(
                         timings[stage] = float(event.get("latencyMs") or 0.0)
                         models[stage] = event.get("details", {})
                     yield json.dumps(event, ensure_ascii=False) + "\n"
+                    # Let the ASGI transport flush progress before a long synchronous model warm starts.
+                    await asyncio.sleep(0.01)
                 yield json.dumps({"event": "result", "status": "ready", "timingsMs": timings, "models": models}, ensure_ascii=False) + "\n"
             except Exception as exc:
                 yield json.dumps({"event": "error", "type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False) + "\n"
@@ -265,6 +279,7 @@ def create_app(
         audio: UploadFile = File(...),
         tts_provider: str | None = Form(default=None),
         tts_voice: str | None = Form(default=None),
+        tts_model: str | None = Form(default=None),
         asr_provider: str | None = Form(default=None),
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
@@ -279,6 +294,7 @@ def create_app(
             {
                 "ttsProvider": tts_provider,
                 "ttsVoice": tts_voice,
+                "ttsModel": tts_model,
                 "asrProvider": asr_provider,
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
@@ -313,6 +329,7 @@ def create_app(
         audio: UploadFile = File(...),
         tts_provider: str | None = Form(default=None),
         tts_voice: str | None = Form(default=None),
+        tts_model: str | None = Form(default=None),
         asr_provider: str | None = Form(default=None),
         asr_locale: str | None = Form(default=None),
         asr_model: str | None = Form(default=None),
@@ -327,6 +344,7 @@ def create_app(
             {
                 "ttsProvider": tts_provider,
                 "ttsVoice": tts_voice,
+                "ttsModel": tts_model,
                 "asrProvider": asr_provider,
                 "asrLocale": asr_locale,
                 "asrModel": asr_model,
@@ -379,6 +397,7 @@ def create_app(
         media_type = "audio/webm"
         llm_prompt = None
         llm_context = None
+        preload_payload = None
         turn_task = None
         disconnect_task = None
         try:
@@ -386,16 +405,50 @@ def create_app(
                 message = await websocket.receive()
                 if message.get("text") is not None:
                     payload = json.loads(message["text"])
-                    if payload.get("type") == "config":
+                    message_type = payload.get("type")
+                    if message_type == "preload":
+                        preload_payload = payload
+                        request_settings = _settings_with_request_options(resolved_settings, payload)
+                    if message_type == "config":
                         request_settings = _settings_with_request_options(resolved_settings, payload)
                         filename = payload.get("filename") or filename
                         media_type = payload.get("mediaType") or media_type
                         llm_prompt = payload.get("llmPrompt")
                         llm_context = payload.get("llmContext")
-                    if payload.get("type") == "end":
+                    if message_type == "end":
                         break
                 elif message.get("bytes") is not None:
                     audio_chunks.append(message["bytes"])
+            if preload_payload is not None:
+                timings: dict[str, float] = {}
+                models: dict[str, object] = {}
+                async for event in iter_warm_real_chain(request_settings):
+                    if event.get("event") != "model_loaded":
+                        continue
+                    stage = str(event["stage"])
+                    timings[stage] = float(event.get("latencyMs") or 0.0)
+                    models[stage] = event.get("details", {})
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "event": "progress",
+                                "stage": stage,
+                                "status": "preloaded",
+                                "latencyMs": event.get("latencyMs"),
+                                "details": event.get("details", {}),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                await websocket.send_text(
+                    json.dumps(
+                        {"event": "result", "status": "ready", "timingsMs": timings, "models": models},
+                        ensure_ascii=False,
+                    )
+                )
+                await websocket.send_text(json.dumps({"event": "done"}))
+                await websocket.close(code=1000)
+                return
             if not audio_chunks:
                 raise RuntimeError("Turn stream ended without audio chunks")
 
@@ -441,6 +494,7 @@ def create_app(
             result_payload["tts"]["audioBase64"] = None
             await websocket.send_text(json.dumps({"event": "result", "mode": f"{turn_mode}-audio-turn", "result": result_payload}, ensure_ascii=False))
             await websocket.send_text(json.dumps({"event": "done"}))
+            await websocket.close(code=1000)
         except asyncio.CancelledError:
             if turn_task is not None:
                 turn_task.cancel()
@@ -454,6 +508,7 @@ def create_app(
         except Exception as exc:
             await websocket.send_text(json.dumps({"event": "error", "type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
             await websocket.send_text(json.dumps({"event": "done"}))
+            await websocket.close(code=1011)
 
     @app.websocket("/api/session/text-turn-ws")
     async def real_text_turn_ws(websocket: WebSocket) -> None:
@@ -641,9 +696,11 @@ def _turn_llm_context(value: object, llm_config: dict[str, str]) -> str:
     return str(value)
 
 
-def _settings_with_request_options(settings: Settings, options: dict[str, str | None]) -> Settings:
+def _settings_with_request_options(settings: Settings, options: dict[str, object]) -> Settings:
+    options = _request_options_with_qai_module_aliases(options)
     updated = _settings_with_tts_provider(settings, options.get("ttsProvider"))
     updated = _settings_with_tts_voice(updated, options.get("ttsVoice"))
+    tts_model = options.get("ttsModel") or options.get("ttsVoice")
     asr_provider = options.get("asrProvider")
     asr_locale = options.get("asrLocale")
     asr_model = options.get("asrModel")
@@ -660,10 +717,19 @@ def _settings_with_request_options(settings: Settings, options: dict[str, str | 
     if llm_model and updated.providers.llm == "llama-cpp":
         llama_cpp = replace(updated.llama_cpp, model=llm_model)
         updated = replace(updated, llama_cpp=llama_cpp)
+    if llm_model and updated.providers.llm == GEMMA_4_E2B_ASR_PROVIDER:
+        gemma_4_e2b = replace(updated.gemma_4_e2b, model_id=llm_model)
+        updated = replace(updated, gemma_4_e2b=gemma_4_e2b)
+    if llm_model and updated.providers.llm == LFM2_AUDIO_PROVIDER:
+        lfm2_audio = replace(updated.lfm2_audio, model_id=LFM2_AUDIO_MODEL_ID)
+        updated = replace(updated, lfm2_audio=lfm2_audio)
     if asr_provider:
         providers = replace(updated.providers, asr=_normalize_asr_provider(asr_provider))
         providers.validate()
         updated = replace(updated, providers=providers)
+    if asr_model and updated.providers.asr == LFM2_AUDIO_PROVIDER:
+        lfm2_audio = replace(updated.lfm2_audio, model_id=LFM2_AUDIO_MODEL_ID)
+        updated = replace(updated, lfm2_audio=lfm2_audio)
     if asr_model and updated.providers.asr == "foundry-local":
         foundry = replace(updated.foundry, asr_model=asr_model)
         updated = replace(updated, foundry=foundry)
@@ -676,7 +742,50 @@ def _settings_with_request_options(settings: Settings, options: dict[str, str | 
     if asr_locale and asr_locale != "auto":
         audio = replace(updated.audio, azure_embedded_asr_locale=asr_locale)
         updated = replace(updated, audio=audio)
+    if tts_model and updated.providers.tts == LFM2_AUDIO_PROVIDER:
+        lfm2_audio = replace(updated.lfm2_audio, model_id=LFM2_AUDIO_MODEL_ID)
+        updated = replace(updated, lfm2_audio=lfm2_audio)
+    return _settings_with_lfm2_audio_constraints(_settings_with_gemma_4_e2b_constraints(updated, asr_model))
+
+
+def _request_options_with_qai_module_aliases(options: dict[str, object]) -> dict[str, object]:
+    modules = options.get("qaiModules")
+    if not isinstance(modules, dict):
+        return options
+
+    updated = dict(options)
+    if any(str(modules.get(stage) or "").strip().lower() == "lfm2.5-audio-qai" for stage in ("asr", "llm", "tts")):
+        updated.setdefault("asrProvider", LFM2_AUDIO_PROVIDER)
+        updated.setdefault("asrModel", LFM2_AUDIO_MODEL_ID)
+        updated.setdefault("llmProvider", LFM2_AUDIO_PROVIDER)
+        updated.setdefault("llmModel", LFM2_AUDIO_MODEL_ID)
+        updated.setdefault("ttsProvider", LFM2_AUDIO_PROVIDER)
+        updated.setdefault("ttsModel", LFM2_AUDIO_MODEL_ID)
     return updated
+
+
+def _settings_with_gemma_4_e2b_constraints(settings: Settings, requested_asr_model: str | None = None) -> Settings:
+    if settings.providers.asr != GEMMA_4_E2B_ASR_PROVIDER:
+        return settings
+
+    gemma_model = str(requested_asr_model or "").strip() or settings.gemma_4_e2b.model_id
+    if not is_gemma_4_e2b_model(gemma_model):
+        gemma_model = GEMMA_4_E2B_INSTRUCT_MODEL_ID
+
+    providers = replace(settings.providers, llm=GEMMA_4_E2B_ASR_PROVIDER)
+    providers.validate()
+    gemma_4_e2b = replace(settings.gemma_4_e2b, model_id=gemma_model)
+    return replace(settings, providers=providers, gemma_4_e2b=gemma_4_e2b)
+
+
+def _settings_with_lfm2_audio_constraints(settings: Settings) -> Settings:
+    if LFM2_AUDIO_PROVIDER not in {settings.providers.asr, settings.providers.llm, settings.providers.tts}:
+        return settings
+
+    providers = replace(settings.providers, asr=LFM2_AUDIO_PROVIDER, llm=LFM2_AUDIO_PROVIDER, tts=LFM2_AUDIO_PROVIDER)
+    providers.validate()
+    lfm2_audio = replace(settings.lfm2_audio, model_id=LFM2_AUDIO_MODEL_ID)
+    return replace(settings, providers=providers, lfm2_audio=lfm2_audio)
 
 
 def _normalize_asr_provider(asr_provider: str) -> str:
@@ -684,6 +793,12 @@ def _normalize_asr_provider(asr_provider: str) -> str:
         "foundry-local": "foundry-local",
         "faster-whisper": "faster-whisper",
         "azure-embedded": "azure-embedded",
+        GEMMA_4_E2B_ASR_PROVIDER: GEMMA_4_E2B_ASR_PROVIDER,
+        "gemma": GEMMA_4_E2B_ASR_PROVIDER,
+        "gemma-4": GEMMA_4_E2B_ASR_PROVIDER,
+        LFM2_AUDIO_PROVIDER: LFM2_AUDIO_PROVIDER,
+        "liquid-audio": LFM2_AUDIO_PROVIDER,
+        "lfm2.5-audio": LFM2_AUDIO_PROVIDER,
     }
     normalized = aliases.get(asr_provider)
     if normalized is None:
@@ -700,6 +815,9 @@ def _normalize_tts_provider(tts_provider: str) -> str:
         "windows-winrt": "windows-winrt",
         "azure-speech": "azure-speech",
         "azure-embedded": "azure-embedded",
+        LFM2_AUDIO_PROVIDER: LFM2_AUDIO_PROVIDER,
+        "liquid-audio": LFM2_AUDIO_PROVIDER,
+        "lfm2.5-audio": LFM2_AUDIO_PROVIDER,
     }
     normalized = aliases.get(tts_provider)
     if normalized is None:
@@ -713,6 +831,12 @@ def _normalize_llm_provider(llm_provider: str) -> str:
         "foundry": "foundry-local",
         "llama-cpp": "llama-cpp",
         "llamacpp": "llama-cpp",
+        GEMMA_4_E2B_ASR_PROVIDER: GEMMA_4_E2B_ASR_PROVIDER,
+        "gemma": GEMMA_4_E2B_ASR_PROVIDER,
+        "gemma-4": GEMMA_4_E2B_ASR_PROVIDER,
+        LFM2_AUDIO_PROVIDER: LFM2_AUDIO_PROVIDER,
+        "liquid-audio": LFM2_AUDIO_PROVIDER,
+        "lfm2.5-audio": LFM2_AUDIO_PROVIDER,
     }
     normalized = aliases.get(llm_provider)
     if normalized is None:
@@ -723,6 +847,8 @@ def _normalize_llm_provider(llm_provider: str) -> str:
 def _llm_client_for_settings(settings: Settings):
     if settings.providers.llm == "llama-cpp":
         return LlamaCppLLM(settings.llama_cpp)
+    if settings.providers.llm == GEMMA_4_E2B_ASR_PROVIDER:
+        return Gemma4E2BLLM(settings.gemma_4_e2b)
     return FoundryLocalLLM(settings.foundry)
 
 

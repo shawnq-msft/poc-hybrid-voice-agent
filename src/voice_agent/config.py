@@ -1,17 +1,58 @@
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 
-LOCAL_ASR_PROVIDERS = {"foundry-local", "faster-whisper", "azure-embedded", "whisper-cpp", "vosk"}
+GEMMA_4_E2B_ASR_PROVIDER = "gemma-4-e2b"
+GEMMA_4_E2B_HF_MODEL_ID = "google/gemma-4-E2B"
+GEMMA_4_E2B_FULL_INSTRUCT_MODEL_ID = "google/gemma-4-E2B-it"
+GEMMA_4_E2B_INSTRUCT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
+GEMMA_4_E2B_MAX_AUDIO_SECONDS = 30
+LFM2_AUDIO_PROVIDER = "lfm2-audio"
+LFM2_AUDIO_MODEL_ID = "LiquidAI/LFM2.5-Audio-1.5B"
+GEMMA_4_E2B_MODEL_ALIASES = frozenset(
+    {
+        "gemma-4-e2b",
+        "gemma-4-e2b-it",
+        GEMMA_4_E2B_HF_MODEL_ID,
+        GEMMA_4_E2B_FULL_INSTRUCT_MODEL_ID,
+        GEMMA_4_E2B_INSTRUCT_MODEL_ID,
+    }
+)
+
+
+def is_gemma_4_e2b_model(model: str | None) -> bool:
+    normalized = str(model or "").strip().lower()
+    return normalized in {alias.lower() for alias in GEMMA_4_E2B_MODEL_ALIASES}
+
+
+LOCAL_ASR_PROVIDERS = {"foundry-local", "faster-whisper", "azure-embedded", GEMMA_4_E2B_ASR_PROVIDER, LFM2_AUDIO_PROVIDER, "whisper-cpp", "vosk"}
 ASR_PROVIDER_CAPABILITIES = {
     "azure-embedded": {"inferenceMode": "streaming", "transportMode": "streaming", "vadRole": "start"},
     "foundry-local": {"inferenceMode": "streaming", "transportMode": "streaming", "vadRole": "start-end"},
     "faster-whisper": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
+    GEMMA_4_E2B_ASR_PROVIDER: {
+        "inferenceMode": "batch",
+        "transportMode": "streaming",
+        "vadRole": "start-end",
+        "maxAudioSeconds": GEMMA_4_E2B_MAX_AUDIO_SECONDS,
+        "requiresLlmProvider": GEMMA_4_E2B_ASR_PROVIDER,
+        "requiresLlmModel": GEMMA_4_E2B_INSTRUCT_MODEL_ID,
+    },
+    LFM2_AUDIO_PROVIDER: {
+        "inferenceMode": "audio-to-audio",
+        "transportMode": "streaming",
+        "vadRole": "start-end",
+        "requiresLlmProvider": LFM2_AUDIO_PROVIDER,
+        "requiresLlmModel": LFM2_AUDIO_MODEL_ID,
+        "requiresTtsProvider": LFM2_AUDIO_PROVIDER,
+        "requiresTtsModel": LFM2_AUDIO_MODEL_ID,
+    },
     "whisper-cpp": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
     "vosk": {"inferenceMode": "batch", "transportMode": "streaming", "vadRole": "start-end"},
 }
@@ -27,9 +68,9 @@ FOUNDRY_STREAMING_ASR_MODELS = {
         "modelId": "nemotron-speech-streaming-en-0.6b-generic-cpu:3",
     },
 }
-LOCAL_TTS_PROVIDERS = {"windows-winrt", "windows-sapi", "edge-tts", "azure-speech", "azure-embedded"}
+LOCAL_TTS_PROVIDERS = {"windows-winrt", "windows-sapi", "edge-tts", "azure-speech", "azure-embedded", LFM2_AUDIO_PROVIDER}
 LOCAL_VAD_PROVIDERS = {"silero", "webrtcvad", "energy"}
-LOCAL_LLM_PROVIDERS = {"foundry-local", "llama-cpp"}
+LOCAL_LLM_PROVIDERS = {"foundry-local", "llama-cpp", GEMMA_4_E2B_ASR_PROVIDER, LFM2_AUDIO_PROVIDER}
 
 
 def _env(env: Mapping[str, str], name: str, default: str) -> str:
@@ -132,6 +173,28 @@ class LlamaCppSettings:
 
 
 @dataclass(frozen=True)
+class Gemma4E2BSettings:
+    model_id: str = GEMMA_4_E2B_INSTRUCT_MODEL_ID
+    model_dir: Path = Path("models/llm/gemma-4-e2b")
+    allow_download: bool = False
+    max_new_tokens: int = 128
+    audio_turn_max_new_tokens: int = 32
+    torch_threads: int = 0
+    torch_interop_threads: int = 2
+
+
+@dataclass(frozen=True)
+class LFM2AudioSettings:
+    model_id: str = LFM2_AUDIO_MODEL_ID
+    model_dir: Path = Path("models/lfm2-audio/LFM2.5-Audio-1.5B")
+    allow_download: bool = False
+    max_new_tokens: int = 512
+    audio_temperature: float = 1.0
+    audio_top_k: int = 4
+    torch_threads: int = 0
+
+
+@dataclass(frozen=True)
 class AudioSettings:
     asr_language: str = "auto"
     faster_whisper_model: str = "tiny"
@@ -174,6 +237,8 @@ class Settings:
     providers: ProviderSettings
     foundry: FoundrySettings
     llama_cpp: LlamaCppSettings
+    gemma_4_e2b: Gemma4E2BSettings
+    lfm2_audio: LFM2AudioSettings
     audio: AudioSettings
     copilot_tools: CopilotToolSettings
     server: ServerSettings
@@ -269,6 +334,24 @@ class Settings:
                 slot_id=_env_int(env, "VOICE_AGENT_LLAMA_CPP_SLOT_ID", 0),
                 timeout_seconds=_env_float(env, "VOICE_AGENT_LLAMA_CPP_TIMEOUT_SECONDS", 180.0),
             ),
+            gemma_4_e2b=Gemma4E2BSettings(
+                model_id=_env(env, "VOICE_AGENT_GEMMA_4_E2B_MODEL", GEMMA_4_E2B_INSTRUCT_MODEL_ID),
+                model_dir=_path(root, _env(env, "VOICE_AGENT_GEMMA_4_E2B_MODEL_DIR", "models/llm/gemma-4-e2b")),
+                allow_download=_env_bool(env, "VOICE_AGENT_GEMMA_4_E2B_ALLOW_DOWNLOAD", False),
+                max_new_tokens=_env_int(env, "VOICE_AGENT_GEMMA_4_E2B_MAX_NEW_TOKENS", 128),
+                audio_turn_max_new_tokens=_env_int(env, "VOICE_AGENT_GEMMA_4_E2B_AUDIO_TURN_MAX_NEW_TOKENS", 32),
+                torch_threads=_env_int(env, "VOICE_AGENT_GEMMA_4_E2B_TORCH_THREADS", os.cpu_count() or 1),
+                torch_interop_threads=_env_int(env, "VOICE_AGENT_GEMMA_4_E2B_TORCH_INTEROP_THREADS", 2),
+            ),
+            lfm2_audio=LFM2AudioSettings(
+                model_id=_env(env, "VOICE_AGENT_LFM2_AUDIO_MODEL", LFM2_AUDIO_MODEL_ID),
+                model_dir=_path(root, _env(env, "VOICE_AGENT_LFM2_AUDIO_MODEL_DIR", "models/lfm2-audio/LFM2.5-Audio-1.5B")),
+                allow_download=_env_bool(env, "VOICE_AGENT_LFM2_AUDIO_ALLOW_DOWNLOAD", False),
+                max_new_tokens=_env_int(env, "VOICE_AGENT_LFM2_AUDIO_MAX_NEW_TOKENS", 512),
+                audio_temperature=_env_float(env, "VOICE_AGENT_LFM2_AUDIO_TEMPERATURE", 1.0),
+                audio_top_k=_env_int(env, "VOICE_AGENT_LFM2_AUDIO_TOP_K", 4),
+                torch_threads=_env_int(env, "VOICE_AGENT_LFM2_AUDIO_TORCH_THREADS", os.cpu_count() or 1),
+            ),
             audio=audio,
             copilot_tools=CopilotToolSettings(
                 enabled=_env_bool(env, "VOICE_AGENT_COPILOT_TOOLS_ENABLED", True),
@@ -291,6 +374,22 @@ class Settings:
         )
 
     def public_summary(self) -> dict[str, object]:
+        gemma_llm_model = self.gemma_4_e2b.model_id
+        lfm2_audio_model = self.lfm2_audio.model_id
+        lfm2_audio_option = {
+            "provider": LFM2_AUDIO_PROVIDER,
+            "model": lfm2_audio_model,
+            "hfModel": LFM2_AUDIO_MODEL_ID,
+            "label": "LiquidAI LFM2.5 Audio 1.5B",
+            "runtime": "liquid-audio",
+            "modalities": ["audio-in", "text", "audio-out"],
+            "requiresAsrProvider": LFM2_AUDIO_PROVIDER,
+            "requiresAsrModel": lfm2_audio_model,
+            "requiresLlmProvider": LFM2_AUDIO_PROVIDER,
+            "requiresLlmModel": lfm2_audio_model,
+            "requiresTtsProvider": LFM2_AUDIO_PROVIDER,
+            "requiresTtsModel": lfm2_audio_model,
+        }
         return {
             "providers": {
                 "vad": self.providers.vad,
@@ -299,6 +398,67 @@ class Settings:
                 "llm": self.providers.llm,
                 "cloudFallbackEnabled": self.providers.cloud_fallback_enabled,
                 "asrCapabilities": ASR_PROVIDER_CAPABILITIES,
+                "modelOptions": {
+                    "asr": [
+                        {
+                            "provider": GEMMA_4_E2B_ASR_PROVIDER,
+                            "model": gemma_llm_model,
+                            "hfModel": GEMMA_4_E2B_HF_MODEL_ID,
+                            "fullPrecisionModel": GEMMA_4_E2B_FULL_INSTRUCT_MODEL_ID,
+                            "label": "Gemma 4 E2B QAT multimodal ASR",
+                            "runtime": "hf-transformers",
+                            "quantization": "QAT mobile 8-bit",
+                            "modalities": ["text", "image", "audio"],
+                            "maxAudioSeconds": GEMMA_4_E2B_MAX_AUDIO_SECONDS,
+                            "requiresLlmProvider": GEMMA_4_E2B_ASR_PROVIDER,
+                            "requiresLlmModel": gemma_llm_model,
+                        },
+                        lfm2_audio_option,
+                    ],
+                    "llm": [
+                        {
+                            "provider": GEMMA_4_E2B_ASR_PROVIDER,
+                            "model": gemma_llm_model,
+                            "hfModel": GEMMA_4_E2B_HF_MODEL_ID,
+                            "fullPrecisionModel": GEMMA_4_E2B_FULL_INSTRUCT_MODEL_ID,
+                            "label": "Gemma 4 E2B IT QAT",
+                            "runtime": "hf-transformers",
+                            "quantization": "QAT mobile 8-bit",
+                            "modalities": ["text", "image", "audio"],
+                        },
+                        lfm2_audio_option,
+                    ],
+                    "tts": [lfm2_audio_option],
+                },
+            },
+            "lfm2Audio": {
+                "provider": LFM2_AUDIO_PROVIDER,
+                "model": lfm2_audio_model,
+                "hfModel": LFM2_AUDIO_MODEL_ID,
+                "preferredRuntime": "liquid-audio",
+                "modelDir": str(self.lfm2_audio.model_dir),
+                "allowDownload": self.lfm2_audio.allow_download,
+                "maxNewTokens": self.lfm2_audio.max_new_tokens,
+                "audioTemperature": self.lfm2_audio.audio_temperature,
+                "audioTopK": self.lfm2_audio.audio_top_k,
+                "torchThreads": self.lfm2_audio.torch_threads,
+                "modalities": ["audio-in", "text", "audio-out"],
+            },
+            "gemma4E2B": {
+                "provider": GEMMA_4_E2B_ASR_PROVIDER,
+                "hfModel": GEMMA_4_E2B_HF_MODEL_ID,
+                "fullPrecisionModel": GEMMA_4_E2B_FULL_INSTRUCT_MODEL_ID,
+                "instructModel": gemma_llm_model,
+                "preferredRuntime": "hf-transformers",
+                "quantization": "QAT mobile 8-bit",
+                "modelDir": str(self.gemma_4_e2b.model_dir),
+                "allowDownload": self.gemma_4_e2b.allow_download,
+                "maxAudioSeconds": GEMMA_4_E2B_MAX_AUDIO_SECONDS,
+                "maxNewTokens": self.gemma_4_e2b.max_new_tokens,
+                "audioTurnMaxNewTokens": self.gemma_4_e2b.audio_turn_max_new_tokens,
+                "torchThreads": self.gemma_4_e2b.torch_threads,
+                "torchInteropThreads": self.gemma_4_e2b.torch_interop_threads,
+                "modalities": ["text", "image", "audio"],
             },
             "foundry": {
                 "endpoint": self.foundry.endpoint,

@@ -57,6 +57,11 @@ const state = {
   },
 };
 
+const LFM2_AUDIO_MODEL = "LiquidAI/LFM2.5-Audio-1.5B";
+const LFM2_AUDIO_ASR_VALUE = `lfm2-audio:${LFM2_AUDIO_MODEL}:en`;
+const LFM2_AUDIO_LLM_VALUE = `lfm2-audio:${LFM2_AUDIO_MODEL}`;
+const LFM2_AUDIO_TTS_VALUE = `lfm2-audio:${LFM2_AUDIO_MODEL}`;
+
 const VAD = {
   speechThreshold: 0.035,
   silenceThreshold: 0.018,
@@ -139,16 +144,55 @@ function setConfigurationLocked(locked) {
 function syncSelectors(config) {
   setSelectByValue(vadSelector, "silero:500");
   updateVadSelection(false);
-  setSelectByValue(asrSelector, "azure-embedded:zh-CN");
+  if (config.providers.asr === "lfm2-audio" || config.providers.llm === "lfm2-audio" || config.providers.tts === "lfm2-audio") {
+    selectLfm2AudioChain(false);
+  } else {
+    setSelectByValue(asrSelector, "azure-embedded:zh-CN");
+  }
   updateAsrMetricLabel();
   const configuredLlm = `${config.providers.llm}:${config.providers.llm === "llama-cpp" ? config.llamaCpp.model : config.foundry.llmModel}`;
-  setSelectByValue(llmSelector, configuredLlm);
+  if (config.providers.llm !== "lfm2-audio") setSelectByValue(llmSelector, configuredLlm);
   const configuredTts = config.providers.tts === "azure-embedded"
     ? `azure-embedded:${config.audio?.azureEmbeddedTts?.voice || "azure-embedded-zh-CN-XiaoxiaoNeuralV6"}`
     : config.providers.tts;
-  setSelectByValue(ttsSelector, configuredTts);
+  if (config.providers.tts !== "lfm2-audio") setSelectByValue(ttsSelector, configuredTts);
   if (llmPromptInput) llmPromptInput.value = config.llmDefaults?.prompt || "";
   updateAutoContextInput();
+}
+
+function selectLfm2AudioChain(announce = true) {
+  setSelectByValue(asrSelector, LFM2_AUDIO_ASR_VALUE);
+  setSelectByValue(llmSelector, LFM2_AUDIO_LLM_VALUE);
+  setSelectByValue(ttsSelector, LFM2_AUDIO_TTS_VALUE);
+  updateAsrMetricLabel();
+  resetDirectAudioBypassMetrics();
+  setModuleStatus({ asr: "Bypassed", tts: "Bypassed" });
+  if (announce) {
+    logEvent("LFM2.5 Audio selected as one direct audio-in/audio-out speech-to-speech model.");
+  }
+}
+
+function isLfm2AudioChainSelected() {
+  return [asrSelector, llmSelector, ttsSelector].every(isLfm2AudioSelected);
+}
+
+function isLfm2AudioConfig(config) {
+  return config.providers.asr === "lfm2-audio" || config.providers.llm === "lfm2-audio" || config.providers.tts === "lfm2-audio";
+}
+
+function isLfm2AudioSelected(select) {
+  return select.value.startsWith("lfm2-audio:");
+}
+
+function markLfm2AudioChainChanged() {
+  closePreparedTextTurn();
+  state.modelsLoaded = false;
+  state.asrLlmLoadedSignature = null;
+  state.ttsLoadedSignature = null;
+  connectButton.disabled = true;
+  setStatus("LFM2.5 Audio needs reload", true);
+  setModuleStatus({ asr: "Stale", llm: "Stale", tts: "Stale" });
+  logEvent("LFM2.5 Audio selection changed. Load Models again to preload the unified speech-to-speech model.");
 }
 
 function setLlmOptionAvailability(ready = null) {
@@ -201,9 +245,11 @@ function updateVadSelection(announce = true) {
 
 function selectedTtsOptions() {
   const [ttsProvider, ...voiceParts] = ttsSelector.value.split(":");
+  const ttsDetail = voiceParts.join(":") || null;
   return {
     ttsProvider,
-    ttsVoice: voiceParts.join(":") || null,
+    ttsVoice: ttsProvider === "lfm2-audio" ? null : ttsDetail,
+    ttsModel: ttsProvider === "lfm2-audio" ? ttsDetail : null,
   };
 }
 
@@ -420,7 +466,7 @@ function resetContext() {
 
 function selectedAsrOptions() {
   const [asrProvider, asrDetail, asrLanguage] = asrSelector.value.split(":");
-  if (["foundry-local", "faster-whisper"].includes(asrProvider)) {
+  if (["foundry-local", "faster-whisper", "lfm2-audio"].includes(asrProvider)) {
     return { asrProvider, asrModel: asrDetail, asrLanguage: asrLanguage || "auto", asrLocale: "auto" };
   }
   return { asrProvider, asrLocale: asrDetail || "auto", asrLanguage: "auto" };
@@ -441,6 +487,10 @@ function isAzureEmbeddedAsrSelected() {
 
 function updateAsrMetricLabel() {
   if (asrMetricLabel) {
+    if (isLfm2AudioChainSelected()) {
+      asrMetricLabel.textContent = "N/A";
+      return;
+    }
     asrMetricLabel.textContent = isStreamingAsrSelected() ? "Final" : "E2E";
   }
 }
@@ -450,7 +500,9 @@ async function loadConfig() {
     const response = await fetch("/api/config");
     const config = await response.json();
     state.config = config;
-    providerStatus.textContent = `${config.providers.asr} ASR / ${config.providers.tts} TTS / ${config.providers.llm} LLM`;
+    providerStatus.textContent = isLfm2AudioConfig(config)
+      ? "lfm2-audio direct audio-in/audio-out speech-to-speech"
+      : `${config.providers.asr} ASR / ${config.providers.tts} TTS / ${config.providers.llm} LLM`;
     syncSelectors(config);
     const readyResponse = await fetch("/api/ready");
     const ready = await readyResponse.json();
@@ -500,16 +552,21 @@ async function loadModels() {
   state.ttsLoadedSignature = ttsSignature;
   connectButton.disabled = false;
   loadModelsButton.disabled = false;
-  setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
+  setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Idle" });
+  if (isLfm2AudioChainSelected()) resetDirectAudioBypassMetrics();
   setStatus("Models ready");
-  logEvent(`Models loaded: ASR ${formatMs(payload.timingsMs?.asr)}, LLM ${formatMs(payload.timingsMs?.llm)}, TTS ${formatMs(payload.timingsMs?.tts)}.`);
+  if (isLfm2AudioChainSelected()) {
+    logEvent(`LFM2.5 Audio speech-to-speech model loaded: ${formatMs(payload.timingsMs?.llm)}.`);
+  } else {
+    logEvent(`Models loaded: ASR ${formatMs(payload.timingsMs?.asr)}, LLM ${formatMs(payload.timingsMs?.llm)}, TTS ${formatMs(payload.timingsMs?.tts)}.`);
+  }
 }
 
 async function readModelLoadEvents(requestPayload) {
   const response = await fetch("/api/models/load", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestPayload),
+    body: JSON.stringify(compactPayload(requestPayload)),
   });
   if (!response.body) {
     const payload = await response.json().catch(() => ({}));
@@ -530,6 +587,7 @@ async function readModelLoadEvents(requestPayload) {
     for (const line of lines) {
       if (!line.trim()) continue;
       const event = JSON.parse(line);
+      if (event.event === "model_loading") applyModelLoadingEvent(event);
       if (event.event === "model_loaded") applyModelLoadEvent(event);
       if (event.event === "result") result = event;
       if (event.event === "error") throw new Error(event.message || "Model load failed");
@@ -540,18 +598,36 @@ async function readModelLoadEvents(requestPayload) {
   return result;
 }
 
+function compactPayload(payload) {
+  return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== null && value !== undefined));
+}
+
+function applyModelLoadingEvent(event) {
+  const stage = event.stage;
+  const label = stage.toUpperCase();
+  const details = event.details || {};
+  const isLfm2Stage = details.provider === "lfm2-audio";
+  const model = details.model || details.provider || "model";
+  logEvent(`${isLfm2Stage ? "LFM2.5 Audio" : label} ${model} loading. ${event.message || "Please wait."}`);
+  if (stage === "asr") setModuleStatus({ asr: isLfm2Stage ? "Bypassed" : "Loading" });
+  if (stage === "llm") setModuleStatus({ llm: "Loading" });
+  if (stage === "tts") setModuleStatus({ tts: isLfm2Stage ? "Bypassed" : "Loading" });
+}
+
 function applyModelLoadEvent(event) {
   const stage = event.stage;
   const label = stage.toUpperCase();
   const memory = formatMb(event.memoryRssMb);
   const delta = formatSignedMb(event.memoryDeltaMb);
   const details = event.details || {};
+  const isLfm2Stage = details.provider === "lfm2-audio";
   const model = details.model || details.voice || details.modelStatus?.id || details.provider || "model";
   const memorySource = event.memorySource === "sidecar" ? "sidecar RSS" : "server RSS";
-  logEvent(`${label} ${model} loaded in ${formatMs(event.latencyMs)}; ${memorySource} ${memory}; delta ${delta}.`);
-  if (stage === "asr") setModuleStatus({ asr: "Loaded" });
+  const cached = details.cached ? " cached" : "";
+  logEvent(`${isLfm2Stage ? "LFM2.5 Audio" : label} ${model} loaded${cached} in ${formatMs(event.latencyMs)}; ${memorySource} ${memory}; delta ${delta}.`);
+  if (stage === "asr") setModuleStatus({ asr: isLfm2Stage ? "Bypassed" : "Loaded" });
   if (stage === "llm") setModuleStatus({ llm: "Loaded" });
-  if (stage === "tts") setModuleStatus({ tts: "Loaded" });
+  if (stage === "tts") setModuleStatus({ tts: isLfm2Stage ? "Bypassed" : "Loaded" });
 }
 
 async function start() {
@@ -588,7 +664,8 @@ async function start() {
   muteButton.disabled = false;
   disconnectButton.disabled = false;
   setStatus("Listening");
-  setModuleStatus({ mic: "Open", asr: "Idle", llm: "Idle", tts: "Idle" });
+  setModuleStatus({ mic: "Open", asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Idle" });
+  if (isLfm2AudioChainSelected()) resetDirectAudioBypassMetrics();
   setVad("Listening");
   logEvent("Microphone started. VAD is listening for speech.");
 }
@@ -729,7 +806,7 @@ async function sendDetectedTurn() {
   state.sending = true;
   setStatus("Processing turn");
   setVad("Triggered");
-  setModuleStatus({ asr: "Finalizing", llm: "Queued", tts: "Queued" });
+  setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Finalizing", llm: "Queued", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Queued" });
   try {
     const blob = await stopRecorder();
     setVad("Listening");
@@ -741,11 +818,11 @@ async function sendDetectedTurn() {
     const speechToSpeechMs = performance.now() - state.vad.speechEndedAt;
     renderRealTurn(result);
     updateMetrics(result.timingsMs || {}, speechToSpeechMs);
-    setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
+    setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Idle" });
     logEvent(`Turn complete. Upload+response ${formatMs(performance.now() - responseStarted)}, speech-to-speech ${formatMs(speechToSpeechMs)}.`);
   } catch (error) {
     logEvent(error.message);
-    setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
+    setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Idle" });
   } finally {
     resetVad();
     if (state.connected) {
@@ -819,6 +896,7 @@ async function postTurn(blob) {
   const runtimeOptions = selectedRuntimeOptions();
   formData.append("tts_provider", runtimeOptions.ttsProvider);
   if (runtimeOptions.ttsVoice) formData.append("tts_voice", runtimeOptions.ttsVoice);
+  if (runtimeOptions.ttsModel) formData.append("tts_model", runtimeOptions.ttsModel);
   formData.append("llm_model", runtimeOptions.llmModel);
   formData.append("llm_prompt", runtimeOptions.llmPrompt);
   formData.append("llm_context", runtimeOptions.llmContext);
@@ -1403,10 +1481,17 @@ function applyProgressEvent(event) {
     if (Number.isFinite(event.latencyMs)) updateSingleMetric("vad", event.latencyMs, false);
   }
   if (event.stage === "asr") {
+    if (isLfm2AudioChainSelected()) {
+      resetDirectAudioBypassMetrics();
+      setModuleStatus({ asr: "Bypassed", tts: "Bypassed" });
+      return;
+    }
     if (event.status === "running") setModuleStatus({ asr: "Running", llm: "Waiting", tts: "Waiting" });
     if (event.status === "idle") {
       setModuleStatus({ asr: "Idle", llm: "Running", tts: "Waiting" });
-      if (state.vad.speechEndedAt) {
+      if (event.latencyMs === 0) {
+        updateSingleMetric("asr", 0, false);
+      } else if (state.vad.speechEndedAt) {
         state.currentTurn.asrE2E = performance.now() - state.vad.speechEndedAt;
         updateSingleMetric("asr", state.currentTurn.asrE2E, false);
       } else if (Number.isFinite(event.latencyMs)) {
@@ -1419,7 +1504,7 @@ function applyProgressEvent(event) {
     }
   }
   if (event.stage === "llm") {
-    if (event.status === "running") setModuleStatus({ asr: "Idle", llm: "Running", tts: "Waiting" });
+    if (event.status === "running") setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Running", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Waiting" });
     if (event.status === "ttft" && Number.isFinite(event.latencyMs)) {
       state.currentTurn.llmTtft = event.latencyMs;
       updateSingleMetric("llm", event.latencyMs, false);
@@ -1430,10 +1515,18 @@ function applyProgressEvent(event) {
     if (event.status === "token" && event.text) {
       appendAssistantToken(event.text);
     }
-    if (event.status === "idle") setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Running" });
+    if (event.status === "idle") setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Running" });
     if (event.status !== "token" && event.text && !state.currentTurn.streamedAssistantText) assistantTranscript.textContent = event.text;
   }
   if (event.stage === "tts") {
+    if (isLfm2AudioChainSelected()) {
+      if (event.status === "audio") {
+        enqueueAudioChunk(event);
+      }
+      resetDirectAudioBypassMetrics();
+      setModuleStatus({ tts: "Bypassed" });
+      return;
+    }
     if (event.status === "running") {
       if (state.currentTurn.ttsStartedAt === null) state.currentTurn.ttsStartedAt = performance.now();
       setModuleStatus({ tts: "Running" });
@@ -1453,7 +1546,7 @@ function enqueueAudioChunk(event) {
   state.currentTurn.streamedAudioChunks += 1;
   state.audioQueue.push({ src: `data:${event.audioMediaType};base64,${event.audioBase64}`, text: event.text || "" });
   const voice = event.voice ? ` using ${event.voice}` : "";
-  logEvent(`TTS audio chunk ${state.currentTurn.streamedAudioChunks} queued${voice}.`);
+  logEvent(`${isLfm2AudioChainSelected() ? "LFM audio" : "TTS audio"} chunk ${state.currentTurn.streamedAudioChunks} queued${voice}.`);
   playNextAudioChunk();
 }
 
@@ -1462,7 +1555,7 @@ function enqueueAudioBlob(event, arrayBuffer) {
   state.currentTurn.streamedAudioChunks += 1;
   const blob = new Blob([arrayBuffer], { type: event.audioMediaType || "audio/wav" });
   state.audioQueue.push({ src: URL.createObjectURL(blob), text: event.text || "" });
-  logEvent(`TTS binary audio chunk ${state.currentTurn.streamedAudioChunks} queued.`);
+  logEvent(`${isLfm2AudioChainSelected() ? "LFM binary audio" : "TTS binary audio"} chunk ${state.currentTurn.streamedAudioChunks} queued.`);
   playNextAudioChunk();
 }
 
@@ -1471,6 +1564,15 @@ function recordFirstPlayableAudio(event) {
     return;
   }
   const now = performance.now();
+  if (isLfm2AudioChainSelected()) {
+    state.currentTurn.ttsFirstByteMs = 0;
+    resetDirectAudioBypassMetrics();
+    if (state.vad.speechEndedAt) {
+      state.currentTurn.voiceToVoiceFirstByteMs = now - state.vad.speechEndedAt;
+      updateSingleMetric("voiceToVoice", state.currentTurn.voiceToVoiceFirstByteMs, false);
+    }
+    return;
+  }
   const ttsFirstByteMs = state.currentTurn.ttsStartedAt
     ? now - state.currentTurn.ttsStartedAt
     : event.latencyMs;
@@ -1539,7 +1641,7 @@ function playNextAudioChunk() {
 
 async function runBackendCheck() {
   setStatus("Running backend check");
-  setModuleStatus({ asr: "Running", llm: "Running", tts: "Running" });
+  setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Running", llm: "Running", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Running" });
   backendCheckButton.disabled = true;
   const responseStarted = performance.now();
   const response = await fetch("/api/session/backend-check", {
@@ -1556,7 +1658,7 @@ async function runBackendCheck() {
   renderRealTurn(payload.result);
   updateMetrics(payload.result.timingsMs || {}, payload.result.timingsMs?.backendTotal || fallbackTiming);
   setStatus("Backend check passed");
-  setModuleStatus({ asr: "Idle", llm: "Idle", tts: "Idle" });
+  setModuleStatus({ asr: isLfm2AudioChainSelected() ? "Bypassed" : "Idle", llm: "Idle", tts: isLfm2AudioChainSelected() ? "Bypassed" : "Idle" });
   logEvent(`${payload.mode} passed with ${payload.result.asr.provider} ASR.`);
 }
 
@@ -1611,7 +1713,11 @@ function renderRealTurn(result) {
   updateResponsePlaybackUser(result.userText);
   state.responsePlayback.resultReceived = true;
   const ttsVoice = result.tts.voice ? ` (${result.tts.voice})` : "";
-  logEvent(`real-audio-turn passed with ${result.vad?.provider || "unknown"} VAD, ${result.asr.provider} ASR and ${result.tts.provider}${ttsVoice} TTS.`);
+  if (isLfm2Result(result)) {
+    logEvent(`real-audio-turn passed with ${result.vad?.provider || "unknown"} VAD and ${result.llm.provider} speech-to-speech${ttsVoice}.`);
+  } else {
+    logEvent(`real-audio-turn passed with ${result.vad?.provider || "unknown"} VAD, ${result.asr.provider} ASR and ${result.tts.provider}${ttsVoice} TTS.`);
+  }
   if (state.currentTurn.streamedAudioChunks > 0) {
     maybeFinalizeCompletedPlayback();
     return;
@@ -1656,13 +1762,20 @@ function renderRealTurn(result) {
   }
 }
 
+function isLfm2Result(result) {
+  return result?.llm?.provider === "lfm2-audio" && result?.tts?.provider === "lfm2-audio";
+}
+
 function updateMetrics(timings, speechToSpeechMs, includeAverage = true) {
+  const lfm2DirectAudio = isLfm2AudioChainSelected() || timings.asr === 0;
   const llmTtft = timings.llm;
   const llmFirstPunctuation = Number.isFinite(state.currentTurn.llmFirstPunctuation)
     ? state.currentTurn.llmFirstPunctuation
     : Math.max(0, (timings.llmFirstSentence ?? timings.llm ?? 0) - (timings.llm ?? 0));
   const ttsFirstByte = state.currentTurn.ttsFirstByteMs ?? timings.tts;
-  const voiceToVoice = state.currentTurn.voiceToVoiceFirstByteMs ?? (state.currentTurn.streamingAsr
+  const voiceToVoice = state.currentTurn.voiceToVoiceFirstByteMs ?? (lfm2DirectAudio
+    ? sumFinite(state.currentTurn.vadE2E ?? timings.vad, llmTtft, llmFirstPunctuation)
+    : state.currentTurn.streamingAsr
     ? sumFinite(state.currentTurn.asrE2E ?? timings.asr, llmTtft, llmFirstPunctuation, ttsFirstByte)
     : sumFinite(
         state.currentTurn.vadE2E ?? timings.vad,
@@ -1673,11 +1786,12 @@ function updateMetrics(timings, speechToSpeechMs, includeAverage = true) {
       ));
   const normalized = {
     vad: state.currentTurn.vadE2E ?? timings.vad,
-    asr: state.currentTurn.asrE2E ?? timings.asr,
+    asr: lfm2DirectAudio ? undefined : state.currentTurn.asrE2E ?? timings.asr,
     llm: llmTtft,
-    tts: ttsFirstByte,
+    tts: lfm2DirectAudio ? undefined : ttsFirstByte,
     voiceToVoice: Number.isFinite(voiceToVoice) ? voiceToVoice : undefined,
   };
+  if (lfm2DirectAudio) resetDirectAudioBypassMetrics();
   for (const [key, value] of Object.entries(normalized)) {
     const [currentElement, averageElement] = metricElements[key];
     if (!Number.isFinite(value)) {
@@ -1686,6 +1800,18 @@ function updateMetrics(timings, speechToSpeechMs, includeAverage = true) {
     currentElement.textContent = formatMs(value);
     if (includeAverage) {
       recordMetric(key, value);
+    }
+  }
+}
+
+function resetDirectAudioBypassMetrics() {
+  state.currentTurn.asrE2E = null;
+  state.metrics.values.asr = [];
+  state.metrics.values.tts = [];
+  for (const key of ["asr", "tts"]) {
+    const elements = metricElements[key] || [];
+    for (const element of elements) {
+      if (element) element.textContent = "N/A";
     }
   }
 }
@@ -1850,11 +1976,30 @@ vadSelector.addEventListener("change", () => {
   markModelsDirty("VAD selection changed. Load Models again before Start.");
 });
 asrSelector.addEventListener("change", () => {
+  if (isLfm2AudioSelected(asrSelector)) {
+    selectLfm2AudioChain();
+    markLfm2AudioChainChanged();
+    return;
+  }
   updateAsrMetricLabel();
   markModelsDirty("ASR selection changed. Load Models again before Start.");
 });
-llmSelector.addEventListener("change", () => markModelsDirty("LLM model changed. Load Models again before Start."));
-ttsSelector.addEventListener("change", markTtsChanged);
+llmSelector.addEventListener("change", () => {
+  if (isLfm2AudioSelected(llmSelector)) {
+    selectLfm2AudioChain();
+    markLfm2AudioChainChanged();
+    return;
+  }
+  markModelsDirty("LLM model changed. Load Models again before Start.");
+});
+ttsSelector.addEventListener("change", () => {
+  if (isLfm2AudioSelected(ttsSelector)) {
+    selectLfm2AudioChain();
+    markLfm2AudioChainChanged();
+    return;
+  }
+  markTtsChanged();
+});
 llmPromptInput?.addEventListener("input", scheduleLlmConfigSync);
 llmContextInput?.addEventListener("input", scheduleLlmConfigSync);
 

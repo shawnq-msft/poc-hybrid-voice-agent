@@ -7,8 +7,9 @@ import _path  # noqa: F401
 
 from voice_agent.config import Settings
 from voice_agent.providers.asr import ASRTranscript
+from voice_agent.providers.lfm2_audio import LFM2AudioVoiceClient
 from voice_agent.providers.llm_foundry import ChatMessage
-from voice_agent.real_turn import AzureEmbeddedTTSClient, check_foundry_ready, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
+from voice_agent.real_turn import AzureEmbeddedTTSClient, RealTurnResult, check_foundry_ready, iter_warm_real_chain, run_real_turn, run_text_turn, warm_real_chain
 
 
 class FakeASR:
@@ -133,6 +134,120 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("stage") == "asr" and event.get("status") == "idle" and event.get("text") for event in events))
         self.assertTrue(any(event.get("stage") == "llm" and event.get("status") == "idle" and event.get("text") for event in events))
         self.assertTrue(any(event.get("stage") == "tts" and event.get("status") == "idle" for event in events))
+
+    async def test_real_turn_routes_lfm2_audio_after_vad_without_default_asr(self):
+        settings = Settings.from_env(
+            {
+                "VOICE_AGENT_ASR_PROVIDER": "lfm2-audio",
+                "VOICE_AGENT_LLM_PROVIDER": "lfm2-audio",
+                "VOICE_AGENT_TTS_PROVIDER": "lfm2-audio",
+            },
+            base_dir=Path("C:/workspace"),
+        )
+        calls = []
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        class FakeLFM2AudioVoiceClient:
+            def __init__(self, client_settings):
+                self.settings = client_settings
+
+            def warm(self):
+                calls.append({"warm": True})
+                return {"provider": "lfm2-audio", "model": self.settings.lfm2_audio.model_id}
+
+            async def run_audio_turn(self, audio_bytes, filename, media_type, **kwargs):
+                calls.append({"audioBytes": len(audio_bytes), "filename": filename, "mediaType": media_type, **kwargs})
+                if kwargs.get("progress_callback") is not None:
+                    await kwargs["progress_callback"]({"stage": "llm", "status": "idle", "text": "端到端响应"})
+                return RealTurnResult(
+                    status="passed",
+                    user_text="用户音频",
+                    assistant_text="端到端响应",
+                    vad_provider=kwargs.get("vad_provider", "fake-vad"),
+                    asr_provider="direct-audio",
+                    llm_provider="lfm2-audio",
+                    tts_provider="lfm2-audio",
+                    audio_media_type="audio/wav",
+                    audio_base64="",
+                    browser_tts_fallback=False,
+                    timings_ms={"vad": kwargs.get("vad_ms", 0.0), "llm": 1.0, "tts": 2.0, "backendTotal": 3.0},
+                    tts_voice=self.settings.lfm2_audio.model_id,
+                )
+
+        with patch("voice_agent.real_turn.LFM2AudioVoiceClient", FakeLFM2AudioVoiceClient):
+            result = await run_real_turn(
+                settings,
+                audio_bytes=b"0" * 4096,
+                filename="recording.webm",
+                media_type="audio/webm",
+                vad_client=FakeVAD(),
+                progress_callback=collect,
+            )
+
+        self.assertEqual(result.asr_provider, "direct-audio")
+        self.assertEqual(result.llm_provider, "lfm2-audio")
+        self.assertEqual(result.tts_provider, "lfm2-audio")
+        self.assertEqual(calls[0], {"warm": True})
+        self.assertEqual(calls[1]["filename"], "recording.webm")
+        self.assertEqual(calls[1]["vad_provider"], "fake-vad")
+        self.assertFalse(calls[1]["emit_vad_progress"])
+        self.assertEqual([event["stage"] for event in events], ["vad", "vad", "llm"])
+
+    async def test_lfm2_audio_turn_emits_direct_audio_without_asr_progress(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        client = LFM2AudioVoiceClient(settings)
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        def fake_run_audio_turn_sync(audio_bytes, filename, media_type, llm_prompt, llm_context, stream_audio_chunk=None):
+            if stream_audio_chunk is not None:
+                stream_audio_chunk(b"RIFF....WAVE", "端到端响应", 7.0, 7.0)
+            return (
+                "Audio input",
+                "端到端响应",
+                b"RIFF....WAVE",
+                {"asr": 0.0, "llm": 7.0, "llmTotal": 8.0, "tts": 0.0, "ttsTotal": 0.0, "streamedAudioChunks": 1},
+            )
+
+        client._run_audio_turn_sync = fake_run_audio_turn_sync
+        result = await client.run_audio_turn(
+            b"0" * 4096,
+            "recording.webm",
+            "audio/webm",
+            progress_callback=collect,
+            emit_vad_progress=False,
+        )
+
+        self.assertEqual(result.asr_provider, "direct-audio")
+        self.assertNotIn("asr", [event["stage"] for event in events])
+        self.assertEqual(events[0]["stage"], "llm")
+        self.assertTrue(any(event["stage"] == "tts" and event["status"] == "audio" for event in events))
+
+    async def test_lfm2_audio_warm_reports_cache_status(self):
+        settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
+        client = LFM2AudioVoiceClient(settings)
+        model_source = Path("C:/models/lfm2")
+        cache_key = (settings.lfm2_audio.model_id, str(model_source), settings.lfm2_audio.allow_download)
+        original_cache = LFM2AudioVoiceClient._components_cache
+        LFM2AudioVoiceClient._components_cache = {}
+        try:
+            with (
+                patch("voice_agent.providers.lfm2_audio._model_source", return_value=model_source),
+                patch.object(client, "_load_components"),
+            ):
+                cold_details = client.warm()
+                LFM2AudioVoiceClient._components_cache[cache_key] = object()
+                warm_details = client.warm()
+        finally:
+            LFM2AudioVoiceClient._components_cache = original_cache
+
+        self.assertFalse(cold_details["cached"])
+        self.assertTrue(warm_details["cached"])
 
     async def test_real_turn_prepares_llm_during_asr(self):
         settings = Settings.from_env({}, base_dir=Path("C:/workspace"))
@@ -283,6 +398,39 @@ class RealTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("memoryRssMb", events[-1])
         self.assertEqual(summary["status"], "ready")
         self.assertIn("tts", summary["timingsMs"])
+
+    async def test_warm_real_chain_preloads_lfm2_audio_once_for_asr_llm_tts(self):
+        settings = Settings.from_env(
+            {
+                "VOICE_AGENT_ASR_PROVIDER": "lfm2-audio",
+                "VOICE_AGENT_LLM_PROVIDER": "lfm2-audio",
+                "VOICE_AGENT_TTS_PROVIDER": "lfm2-audio",
+            },
+            base_dir=Path("C:/workspace"),
+        )
+        calls = []
+
+        class FakeLFM2AudioVoiceClient:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def warm(self):
+                calls.append(self.settings.lfm2_audio.model_id)
+                return {"provider": "lfm2-audio", "model": self.settings.lfm2_audio.model_id, "mode": "speech-to-speech"}
+
+        with (
+            patch("voice_agent.real_turn.warm_silero_vad"),
+            patch("voice_agent.real_turn.LFM2AudioVoiceClient", FakeLFM2AudioVoiceClient),
+        ):
+            events = [event async for event in iter_warm_real_chain(settings)]
+
+        loaded_events = [event for event in events if event["event"] == "model_loaded"]
+        loading_events = [event for event in events if event["event"] == "model_loading"]
+        self.assertEqual(calls, ["LiquidAI/LFM2.5-Audio-1.5B"])
+        self.assertEqual([event["stage"] for event in loading_events], ["asr", "llm", "tts"])
+        self.assertEqual([event["stage"] for event in loaded_events], ["vad", "asr", "llm", "tts"])
+        self.assertEqual([event["details"].get("provider") for event in loaded_events[1:]], ["lfm2-audio", "lfm2-audio", "lfm2-audio"])
+        self.assertTrue(all(event["details"].get("mode") == "speech-to-speech" for event in loaded_events[1:]))
 
     async def test_warm_real_chain_rejects_missing_foundry_llm_model_before_completion(self):
         settings = Settings.from_env(

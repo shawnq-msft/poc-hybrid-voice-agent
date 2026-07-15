@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Protocol
 
-from voice_agent.config import Settings
+from voice_agent.config import LFM2_AUDIO_PROVIDER, Settings
 from voice_agent.pipecat_runtime.events import ProgressCallback
 from voice_agent.providers.asr import ASRTranscript, AzureEmbeddedASR, FasterWhisperASR, FoundryLocalASR
+from voice_agent.providers.lfm2_audio import LFM2AudioVoiceClient
 from voice_agent.providers.llm_foundry import FoundryLocalLLM
 from voice_agent.providers.llm_llama_cpp import LlamaCppLLM
 from voice_agent.providers.vad import SileroVad, VadDecision
@@ -130,6 +131,9 @@ async def run_pure_pipecat_text_turn(
 
 
 async def _run_pipecat_context(context: PurePipecatTurnContext) -> RealTurnResult:
+    if _is_lfm2_audio_chain(context.settings):
+        return await _run_lfm2_audio_context(context)
+
     try:
         from pipecat.frames.frames import EndFrame, TextFrame
         from pipecat.pipeline.pipeline import Pipeline
@@ -261,6 +265,44 @@ async def _complete_audio_assistant_turn(context: PurePipecatTurnContext, state:
         llm_context=context.llm_context,
         prepared_llm_turn=state.prepared_llm_turn,
     )
+
+
+async def _run_lfm2_audio_context(context: PurePipecatTurnContext) -> RealTurnResult:
+    client = LFM2AudioVoiceClient(context.settings)
+    if context.user_text is not None:
+        return await client.run_text_turn(
+            context.user_text,
+            progress_callback=context.progress_callback,
+            llm_prompt=context.llm_prompt,
+            llm_context=context.llm_context,
+            vad_provider=context.vad_provider,
+            asr_provider=context.asr_provider,
+            vad_ms=context.vad_ms,
+            asr_ms=context.asr_ms,
+        )
+    if context.audio_bytes is None or len(context.audio_bytes) < 128:
+        raise RuntimeError("Recorded audio is too small to transcribe")
+    vad_started = perf_counter()
+    vad = context.vad_client or SileroVad()
+    vad_decision = await vad.analyze_audio(context.audio_bytes, context.filename, context.media_type)
+    vad_ms = _elapsed_ms(vad_started)
+    if not vad_decision.is_speech:
+        await _emit(context.progress_callback, "vad", "failed", latency_ms=vad_ms)
+        raise RuntimeError("Silero VAD detected no speech")
+    return await client.run_audio_turn(
+        context.audio_bytes,
+        context.filename,
+        context.media_type,
+        progress_callback=context.progress_callback,
+        llm_prompt=context.llm_prompt,
+        llm_context=context.llm_context,
+        vad_provider=vad_decision.provider,
+        vad_ms=vad_ms,
+    )
+
+
+def _is_lfm2_audio_chain(settings: Settings) -> bool:
+    return {settings.providers.asr, settings.providers.llm, settings.providers.tts} == {LFM2_AUDIO_PROVIDER}
 
 
 async def _emit(progress_callback: ProgressCallback | None, stage: str, status: str, **payload: object) -> None:

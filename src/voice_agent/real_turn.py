@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from voice_agent.config import Settings
+from voice_agent.config import GEMMA_4_E2B_ASR_PROVIDER, LFM2_AUDIO_PROVIDER, Settings
 from voice_agent.pipecat_runtime.events import ProgressCallback, emit_progress, progress_event
 from voice_agent.providers.asr import ASRTranscript, AzureEmbeddedASR, FasterWhisperASR, FoundryLocalASR, warm_faster_whisper, warm_foundry_streaming_asr
+from voice_agent.providers.gemma4_e2b import Gemma4E2BFusedTurnIncomplete
+from voice_agent.providers.lfm2_audio import LFM2AudioVoiceClient
 from voice_agent.providers.llm_foundry import ChatMessage, FoundryLocalLLM
 from voice_agent.providers.llm_llama_cpp import LlamaCppLLM
 from voice_agent.providers.tts_windows import AsyncAzureEmbeddedTTSGrpcClient, synthesize_azure_embedded_wav, synthesize_edge_mp3, synthesize_sapi_wav
@@ -166,11 +168,6 @@ async def run_real_turn(
     if len(audio_bytes) < 128:
         raise RuntimeError("Recorded audio is too small to transcribe")
 
-    asr = asr_client or _default_asr_client(settings)
-    llm = llm_client or _default_llm_client(settings)
-    owns_tts = tts_client is None
-    tts = tts_client or _default_tts_client(settings)
-
     vad_started = perf_counter()
     vad = vad_client or _default_vad_client(settings)
     await _emit_progress(progress_callback, "vad", "running")
@@ -180,6 +177,47 @@ async def run_real_turn(
         await _emit_progress(progress_callback, "vad", "failed", latency_ms=vad_ms)
         raise RuntimeError("Silero VAD detected no speech")
     await _emit_progress(progress_callback, "vad", "idle", latency_ms=vad_ms)
+
+    if _is_lfm2_audio_chain(settings):
+        lfm2_audio = LFM2AudioVoiceClient(settings)
+        lfm2_audio.warm()
+        return await lfm2_audio.run_audio_turn(
+            audio_bytes,
+            filename,
+            media_type,
+            progress_callback=progress_callback,
+            llm_prompt=llm_prompt,
+            llm_context=llm_context,
+            vad_provider=vad_decision.provider,
+            vad_ms=vad_ms,
+            emit_vad_progress=False,
+        )
+
+    asr = asr_client or _default_asr_client(settings)
+    llm = llm_client or _default_llm_client(settings)
+    owns_tts = tts_client is None
+    tts = tts_client or _default_tts_client(settings)
+
+    if _is_gemma_fused_chain(settings) and hasattr(llm, "complete_audio_turn"):
+        try:
+            return await _complete_gemma_fused_real_turn(
+                settings,
+                audio_bytes,
+                filename,
+                llm,
+                tts,
+                progress_callback,
+                vad_decision.provider,
+                vad_ms,
+                total_started,
+                llm_prompt=llm_prompt,
+                llm_context=llm_context,
+            )
+        finally:
+            if owns_tts and hasattr(tts, "close"):
+                close_result = tts.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
 
     llm_prepare_task = asyncio.create_task(prepare_llm_turn(llm, llm_prompt=llm_prompt, llm_context=llm_context))
     asr_started = perf_counter()
@@ -232,6 +270,106 @@ async def run_real_turn(
             "backendTotal": _elapsed_ms(total_started),
         },
         tts_voice=assistant_turn.tts_voice,
+    )
+
+
+async def _complete_gemma_fused_real_turn(
+    settings: Settings,
+    audio_bytes: bytes,
+    filename: str,
+    llm,
+    tts,
+    progress_callback: ProgressCallback | None,
+    vad_provider: str,
+    vad_ms: float,
+    total_started: float,
+    *,
+    llm_prompt: str | None = None,
+    llm_context: str | None = None,
+) -> RealTurnResult:
+    messages = _base_llm_messages(llm_prompt=llm_prompt, llm_context=llm_context)
+    fused_started = perf_counter()
+    await _emit_progress(progress_callback, "asr", "running")
+    await _emit_progress(progress_callback, "llm", "running")
+    try:
+        fused_result = await llm.complete_audio_turn(audio_bytes, filename, settings.audio.asr_language, messages)
+    except Gemma4E2BFusedTurnIncomplete as exc:
+        fused_ms = _elapsed_ms(fused_started)
+        transcript_text = exc.transcript_text.strip()
+        await _emit_progress(progress_callback, "asr", "idle", latency_ms=fused_ms, text=transcript_text)
+        assistant_turn = await _complete_assistant_turn(
+            settings,
+            transcript_text,
+            llm,
+            tts,
+            progress_callback,
+            llm_prompt=llm_prompt,
+            llm_context=llm_context,
+        )
+        return RealTurnResult(
+            status="passed",
+            user_text=transcript_text,
+            assistant_text=assistant_turn.assistant_text,
+            vad_provider=vad_provider,
+            asr_provider=GEMMA_4_E2B_ASR_PROVIDER,
+            llm_provider=settings.providers.llm,
+            tts_provider=assistant_turn.tts_provider,
+            audio_media_type=assistant_turn.audio_media_type,
+            audio_base64=assistant_turn.audio_base64,
+            browser_tts_fallback=assistant_turn.browser_tts_fallback,
+            timings_ms={
+                "vad": vad_ms,
+                "asr": fused_ms,
+                "gemmaFused": fused_ms,
+                "gemmaFusedFallback": 1.0,
+                **assistant_turn.timings_ms,
+                "backendTotal": _elapsed_ms(total_started),
+            },
+            tts_voice=assistant_turn.tts_voice,
+        )
+
+    fused_ms = _elapsed_ms(fused_started)
+    transcript_text = fused_result.transcript_text.strip()
+    assistant_text = fused_result.assistant_text.strip()
+    if not transcript_text:
+        await _emit_progress(progress_callback, "asr", "failed", latency_ms=fused_ms)
+        raise RuntimeError("Gemma fused turn returned empty transcript")
+    if not assistant_text:
+        await _emit_progress(progress_callback, "llm", "failed", latency_ms=fused_ms)
+        raise RuntimeError("Gemma fused turn returned empty assistant text")
+    await _emit_progress(progress_callback, "asr", "idle", latency_ms=fused_ms, text=transcript_text)
+    await _emit_progress(progress_callback, "llm", "idle", latency_ms=0.0, total_ms=0.0, text=assistant_text)
+
+    tts_started = perf_counter()
+    await _emit_progress(progress_callback, "tts", "running")
+    audio_bytes_out, audio_media_type = await _synthesize_tts(tts, assistant_text)
+    tts_ms = _elapsed_ms(tts_started)
+    audio_base64 = base64.b64encode(audio_bytes_out).decode("ascii")
+    tts_voice = _tts_voice_for_settings(settings)
+    await _emit_progress(progress_callback, "tts", "idle", latency_ms=tts_ms, total_ms=tts_ms, voice=tts_voice)
+    return RealTurnResult(
+        status="passed",
+        user_text=transcript_text,
+        assistant_text=assistant_text,
+        vad_provider=vad_provider,
+        asr_provider=GEMMA_4_E2B_ASR_PROVIDER,
+        llm_provider=settings.providers.llm,
+        tts_provider=settings.providers.tts,
+        audio_media_type=audio_media_type,
+        audio_base64=audio_base64,
+        browser_tts_fallback=False,
+        timings_ms={
+            "vad": vad_ms,
+            "asr": fused_ms,
+            "gemmaFused": fused_ms,
+            "llm": 0.0,
+            "llmFirstSentence": 0.0,
+            "llmTotal": 0.0,
+            "tts": tts_ms,
+            "ttsTotal": tts_ms,
+            "backendTotal": _elapsed_ms(total_started),
+        },
+        tts_voice=tts_voice,
     )
 
 
@@ -684,12 +822,38 @@ async def iter_warm_real_chain(settings: Settings) -> AsyncIterator[dict[str, ob
             "details": details,
         }
 
+    def emit_loading(stage: str, details: dict[str, object], message: str) -> dict[str, object]:
+        return {
+            "event": "model_loading",
+            "stage": stage,
+            "status": "loading",
+            "message": message,
+            "details": details,
+        }
+
     await _preflight_llm(settings)
 
     started = perf_counter()
     memory_before = _current_rss_bytes()
     await asyncio.to_thread(warm_silero_vad)
     yield await emit_loaded("vad", {"provider": "silero"}, started, memory_before)
+
+    if _is_lfm2_audio_chain(settings):
+        started = perf_counter()
+        memory_before = _current_rss_bytes()
+        details = {
+            "provider": LFM2_AUDIO_PROVIDER,
+            "model": settings.lfm2_audio.model_id,
+            "runtime": "liquid-audio",
+            "mode": "speech-to-speech",
+        }
+        yield emit_loading("asr", details, "Loading unified LFM2.5 Audio speech-to-speech model. First CPU load can take several minutes.")
+        yield emit_loading("llm", details, "ASR, LLM, and TTS are backed by the same LFM2.5 Audio model.")
+        yield emit_loading("tts", details, "Waiting for LFM2.5 Audio weights to finish loading.")
+        details = await asyncio.to_thread(LFM2AudioVoiceClient(settings).warm)
+        for stage in ("asr", "llm", "tts"):
+            yield await emit_loaded(stage, details, started, memory_before)
+        return
 
     started = perf_counter()
     memory_before = _current_rss_bytes()
@@ -750,6 +914,14 @@ async def _preflight_llm(settings: Settings) -> None:
         ready = await check_llama_cpp_ready(settings)
         if not ready.get("ready"):
             raise RuntimeError(f"llama.cpp LLM is not ready: {ready.get('error')}")
+
+
+def _is_lfm2_audio_chain(settings: Settings) -> bool:
+    return {settings.providers.asr, settings.providers.llm, settings.providers.tts} == {LFM2_AUDIO_PROVIDER}
+
+
+def _is_gemma_fused_chain(settings: Settings) -> bool:
+    return settings.providers.asr == GEMMA_4_E2B_ASR_PROVIDER and settings.providers.llm == GEMMA_4_E2B_ASR_PROVIDER
 
 
 def _current_rss_bytes() -> int:
